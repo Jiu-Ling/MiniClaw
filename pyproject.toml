@@ -1,0 +1,35 @@
+[project]
+name = "miniclaw"
+version = "0.1.0"
+description = "Minimal recoverable runtime package for MiniClaw"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain-core>=1.0,<2.0",
+    "langgraph>=1.0,<2.0",
+    "openai>=1.68.2,<2.0.0",
+    "pydantic>=2.12.0,<3.0.0",
+    "pydantic-settings>=2.12.0,<3.0.0",
+    "python-dotenv>=1.1.0,<2.0.0",
+    "typer>=0.16.0,<1.0.0",
+    "sqlite-vec>=0.1.6",
+    "httpx>=0.28.0,<1.0.0",
+    "croniter>=6.2.2",
+    "python-telegram-bot>=22.6,<23.0",
+    "rich>=13.0,<14.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0,<9.0.0",
+    "pytest-asyncio>=0.25.0,<1.0.0",
+]
+
+[project.scripts]
+miniclaw = "miniclaw.cli.app:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["miniclaw"]

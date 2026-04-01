@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  miniclaw:
+    build: .
+    container_name: miniclaw
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./.miniclaw:/app/.miniclaw
+      - ./AGENTS.md:/app/AGENTS.md
+      - ./SOUL.md:/app/SOUL.md
+      - ./USER.md:/app/USER.md
+      - ./TOOLS.md:/app/TOOLS.md
+    command: ["miniclaw", "telegram", "polling"]
