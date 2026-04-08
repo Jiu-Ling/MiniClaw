@@ -70,19 +70,43 @@ def _normalize_content_parts(content: Any) -> tuple[str, list[dict[str, Any]]]:
     return "", [normalized] if isinstance(normalized, dict) else []
 
 
-def _serialize_message(message: ChatMessage) -> dict[str, Any]:
+def _serialize_message(message: ChatMessage, *, cache_control: bool = False) -> dict[str, Any]:
     payload: dict[str, Any] = {"role": message.role}
     if message.name is not None:
         payload["name"] = message.name
     if message.tool_call_id is not None:
         payload["tool_call_id"] = message.tool_call_id
     if message.content_parts:
-        payload["content"] = [dict(part) for part in message.content_parts]
+        parts = [dict(part) for part in message.content_parts]
+        if cache_control and parts:
+            parts[-1] = {**parts[-1], "cache_control": {"type": "ephemeral"}}
+        payload["content"] = parts
     elif message.content is not None or message.tool_calls:
-        payload["content"] = message.content
+        if cache_control and message.content:
+            payload["content"] = [
+                {"type": "text", "text": message.content, "cache_control": {"type": "ephemeral"}}
+            ]
+        else:
+            payload["content"] = message.content
     if message.tool_calls:
         payload["tool_calls"] = [_normalize_value(call) for call in message.tool_calls]
     return payload
+
+
+def _parse_usage(usage_source: Any) -> ChatUsage:
+    details = _value(usage_source, "prompt_tokens_details", None)
+    cached_tokens = None
+    cache_creation_tokens = None
+    if details is not None:
+        cached_tokens = _value(details, "cached_tokens", None)
+        cache_creation_tokens = _value(details, "cache_creation_input_tokens", None)
+    return ChatUsage(
+        prompt_tokens=_value(usage_source, "prompt_tokens", None),
+        completion_tokens=_value(usage_source, "completion_tokens", None),
+        total_tokens=_value(usage_source, "total_tokens", None),
+        cached_tokens=cached_tokens,
+        cache_creation_tokens=cache_creation_tokens,
+    )
 
 
 class OpenAICompatibleProvider(ChatProvider):
@@ -95,11 +119,13 @@ class OpenAICompatibleProvider(ChatProvider):
         base_url: str,
         model: str,
         supports_vision: bool = False,
+        enable_prompt_cache: bool = False,
         client: AsyncOpenAI | None = None,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
+        self.enable_prompt_cache = enable_prompt_cache
         self.capabilities = ProviderCapabilities(vision=supports_vision)
         self._client = client or AsyncOpenAI(api_key=api_key, base_url=base_url)
 
@@ -110,7 +136,14 @@ class OpenAICompatibleProvider(ChatProvider):
         model: str | None = None,
         tools: Sequence[dict[str, Any]] | None = None,
     ) -> ChatResponse:
-        request_messages = [_serialize_message(message) for message in messages]
+        first_system_seen = False
+        request_messages = []
+        for msg in messages:
+            apply_cache = False
+            if self.enable_prompt_cache and msg.role == "system" and not first_system_seen:
+                apply_cache = True
+                first_system_seen = True
+            request_messages.append(_serialize_message(msg, cache_control=apply_cache))
         kwargs: dict[str, Any] = {"model": model or self.model, "messages": request_messages}
         if tools:
             kwargs["tools"] = list(tools)
@@ -134,15 +167,7 @@ class OpenAICompatibleProvider(ChatProvider):
         ]
 
         usage_source = _value(response, "usage", None)
-        usage = (
-            ChatUsage(
-                prompt_tokens=_value(usage_source, "prompt_tokens", None),
-                completion_tokens=_value(usage_source, "completion_tokens", None),
-                total_tokens=_value(usage_source, "total_tokens", None),
-            )
-            if usage_source is not None
-            else None
-        )
+        usage = _parse_usage(usage_source) if usage_source is not None else None
 
         return ChatResponse(
             content=content,

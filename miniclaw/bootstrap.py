@@ -124,7 +124,16 @@ def build_tool_registry(
                 default_top_k=resolved_settings.memory_search_top_k if resolved_settings else 10,
             )
         )
-    registry.register_many([_mark_always_active(tool) for tool in builtin_tools])
+    _CORE_TOOLS = {
+        "shell", "read_file", "send", "web_search",
+        "cron", "manage_heartbeat",
+        "load_skill_tools", "load_mcp_tools",
+    }
+    for tool in builtin_tools:
+        if tool.spec.name in _CORE_TOOLS:
+            registry.register(_mark_always_active(tool))
+        else:
+            registry.register(_mark_discoverable(tool))
     return registry
 
 
@@ -183,6 +192,12 @@ def _mark_always_active(tool: RegisteredTool) -> RegisteredTool:
     return RegisteredTool(spec=tool.spec.model_copy(update={"metadata": metadata}), executor=tool.executor)
 
 
+def _mark_discoverable(tool: RegisteredTool) -> RegisteredTool:
+    metadata = dict(tool.spec.metadata)
+    metadata.update({"discoverable": True, "always_active": False})
+    return RegisteredTool(spec=tool.spec.model_copy(update={"metadata": metadata}), executor=tool.executor)
+
+
 def build_thread_control_store(sqlite_path: Path | None = None) -> SQLiteThreadControlStore:
     resolved_path = sqlite_path or _resolve_sqlite_path_from_env()
     return SQLiteThreadControlStore(resolved_path)
@@ -194,6 +209,7 @@ def build_provider(settings: Settings | None = None) -> OpenAICompatibleProvider
         api_key=resolved_settings.api_key,
         base_url=resolved_settings.base_url,
         model=resolved_settings.model,
+        enable_prompt_cache=resolved_settings.enable_prompt_cache,
     )
 
 

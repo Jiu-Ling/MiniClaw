@@ -82,22 +82,30 @@ class LangSmithTracer:
         name: str,
         metadata: Mapping[str, Any] | None = None,
         context: TraceContext | None = None,
+        inputs: Mapping[str, Any] | None = None,
+        run_type: str | None = None,
     ) -> TraceContext:
         context = context or build_span_context(parent, name=name, metadata=metadata)
         self._start_times[context.span_id or context.run_id] = _utc_now()
-        self._create_run(
-            run_id=context.span_id or context.run_id,
-            trace_id=context.trace_id,
-            parent_run_id=parent.span_id or parent.run_id,
-            name=name,
-            run_type="chain",
-            inputs=self._truncate_mapping(
+        resolved_run_type = run_type or "chain"
+        resolved_inputs = (
+            dict(inputs)
+            if inputs is not None
+            else self._truncate_mapping(
                 {
                     "parent_span_id": parent.span_id,
                     "parent_run_id": parent.run_id,
                     "metadata": dict(metadata or {}),
                 }
-            ),
+            )
+        )
+        self._create_run(
+            run_id=context.span_id or context.run_id,
+            trace_id=context.trace_id,
+            parent_run_id=parent.span_id or parent.run_id,
+            name=name,
+            run_type=resolved_run_type,
+            inputs=resolved_inputs,
             extra=self._base_extra(context, metadata=metadata, payload=None),
         )
         return context
@@ -109,8 +117,14 @@ class LangSmithTracer:
         status: str,
         output: Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
+        outputs: Mapping[str, Any] | None = None,
     ) -> None:
         run_id = context.span_id or context.run_id
+        resolved_outputs = (
+            dict(outputs)
+            if outputs is not None
+            else self._truncate_mapping(dict(output or {}))
+        )
         self._update_run(
             run_id=run_id,
             name=context.name,
@@ -118,7 +132,7 @@ class LangSmithTracer:
             start_time=self._start_times.pop(run_id, None),
             end_time=_utc_now(),
             error=_status_to_error(status),
-            outputs=self._truncate_mapping(dict(output or {})),
+            outputs=resolved_outputs,
             extra=self._base_extra(context, metadata=metadata, payload=output, status=status),
         )
 

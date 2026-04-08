@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Iterator, Mapping
 import copy
 from dataclasses import dataclass
@@ -8,13 +7,12 @@ from datetime import datetime, timezone
 import re
 from typing import TYPE_CHECKING, Any
 
+from langgraph.checkpoint.base import Checkpoint
 from langgraph.graph import END, START, StateGraph
 
-from miniclaw.memory import build_memory_context
 from miniclaw.memory.files import MemoryFileStore
 from miniclaw.observability.contracts import NoopTracer, TraceContext
 from miniclaw.persistence.memory_store import MemoryItem, MemoryStore
-from miniclaw.prompting import ContextBuilder
 from miniclaw.prompting.context import prompt_trace_scope
 from miniclaw.runtime.checkpoint import AsyncSQLiteCheckpointer
 from miniclaw.runtime.graph import build_graph
@@ -24,7 +22,8 @@ if TYPE_CHECKING:
     from miniclaw.config.settings import Settings
     from miniclaw.memory.indexer import MemoryIndexer
     from miniclaw.memory.retriever import HybridRetriever
-    from miniclaw.providers.contracts import ChatProvider
+    from miniclaw.providers.contracts import ChatProvider, ChatResponse
+    from miniclaw.tools.contracts import ToolCall, ToolResult
     from miniclaw.tools.registry import ToolRegistry
 
 THREAD_SUMMARY_KIND = "thread_summary"
@@ -90,13 +89,23 @@ class RuntimeService:
         self.mini_provider = mini_provider
         self.tracer = tracer or NoopTracer()
         self.clock = clock if callable(clock) else _utc_now
+        self._checkpointer = AsyncSQLiteCheckpointer(settings.sqlite_path)
+        self._persist_app = self._build_persist_app()
         self._compression_synced_threads: set[str] = set()
         if memory_file_store is not None:
             setattr(self.memory_store, "memory_file_store", memory_file_store)
 
+    def _build_persist_app(self):
+        """Build a minimal graph used only for persisting state to checkpoint."""
+        graph = StateGraph(RuntimeState)
+        graph.add_node("persist", lambda state: state)
+        graph.add_edge(START, "persist")
+        graph.add_edge("persist", END)
+        return graph.compile(checkpointer=self._checkpointer)
+
     def with_messaging_bridge(self, bridge: object) -> "RuntimeService":
         bound = copy.copy(self)
-        tool_registry = getattr(self, "tool_registry", None)
+        tool_registry = self.tool_registry
         if tool_registry is None:
             return bound
         clone = tool_registry.clone()
@@ -169,7 +178,6 @@ class RuntimeService:
             thread_id=thread_id,
             metadata={"mode": "sync"},
         )
-        checkpointer = AsyncSQLiteCheckpointer(self.settings.sqlite_path)
         graph = build_graph(
             settings=self.settings,
             provider=_TracingProviderProxy(
@@ -185,11 +193,14 @@ class RuntimeService:
                 parent_context=run_context,
             ),
             retriever=self.retriever,
-            indexer=getattr(self, "memory_indexer", None),
-            memory_token_budget=getattr(self.settings, "memory_token_budget", 2000),
+            indexer=self.memory_indexer,
+            memory_token_budget=self.settings.memory_token_budget,
         )
-        app = graph.compile(checkpointer=checkpointer)
-        config = {"configurable": {"thread_id": thread_id}}
+        app = graph.compile(checkpointer=self._checkpointer)
+        config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+        langchain_callbacks = _build_langchain_callbacks(self.tracer)
+        if langchain_callbacks:
+            config["callbacks"] = langchain_callbacks
         snapshot = app.get_state(config)
         snapshot_values = snapshot.values if snapshot is not None else {}
         final_status = "error"
@@ -272,6 +283,9 @@ class RuntimeService:
         runtime_metadata: Mapping[str, object] | None = None,
         user_content_parts: list[dict[str, object]] | None = None,
     ) -> Iterator[StreamEvent]:
+        from queue import Queue
+        from threading import Thread
+
         run_context = _safe_start_run(
             self.tracer,
             name="runtime.turn.stream",
@@ -279,234 +293,116 @@ class RuntimeService:
             metadata={"mode": "stream"},
         )
         yield StreamEvent(kind="thinking", text="🤔 MiniClaw is thinking...")
-        _safe_record_event(
-            self.tracer,
-            run_context,
-            name="stream.status",
-            payload={"text": "thinking", "phase": "start"},
+
+        event_queue: Queue[StreamEvent | None] = Queue()
+
+        def on_event(raw: dict[str, Any]) -> None:
+            kind = str(raw.get("kind", ""))
+            text = str(raw.get("text", ""))
+            metadata = {k: v for k, v in raw.items() if k not in ("kind", "text")}
+            event_queue.put(StreamEvent(kind=kind, text=text, metadata=metadata or None))
+
+        graph = build_graph(
+            settings=self.settings,
+            provider=_TracingProviderProxy(
+                provider=self.provider,
+                tracer=self.tracer,
+                parent_context=run_context,
+            ),
+            mini_provider=self.mini_provider,
+            memory_store=self.memory_store,
+            tool_registry=_wrap_tool_registry(
+                self.tool_registry,
+                tracer=self.tracer,
+                parent_context=run_context,
+            ),
+            retriever=self.retriever,
+            indexer=self.memory_indexer,
+            memory_token_budget=self.settings.memory_token_budget,
+            on_event=on_event,
         )
-        prepared_state = self._prepare_stream_state(
+        app = graph.compile(checkpointer=self._checkpointer)
+        config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+        langchain_callbacks = _build_langchain_callbacks(self.tracer)
+        if langchain_callbacks:
+            config["callbacks"] = langchain_callbacks
+
+        snapshot = app.get_state(config)
+        snapshot_values = snapshot.values if snapshot is not None else {}
+        initial_state = self._build_initial_state(
             thread_id=thread_id,
             user_input=user_input,
             runtime_metadata=runtime_metadata,
             user_content_parts=user_content_parts,
+            snapshot_values=snapshot_values,
         )
-        traced_provider = _TracingProviderProxy(
-            provider=self.provider,
-            tracer=self.tracer,
-            parent_context=run_context,
-        )
-        traced_registry = _wrap_tool_registry(
-            self.tool_registry,
-            tracer=self.tracer,
-            parent_context=run_context,
-        )
-        stream_method = getattr(traced_provider, "astream_text", None)
-        if callable(stream_method) and self.tool_registry is None:
-            yielded = False
-            chunk_index = 0
+
+        result_holder: list[dict[str, Any] | None] = [None]
+        error_holder: list[Exception | None] = [None]
+
+        def run_graph() -> None:
             try:
-                provider_messages = self._build_provider_messages(prepared_state, trace_context=run_context)
-                for chunk in _iterate_async_iterator_sync(
-                    stream_method(provider_messages, model=self.settings.model)
-                ):
-                    if not chunk:
-                        continue
-                    yielded = True
-                    _safe_record_event(
-                        self.tracer,
-                        run_context,
-                        name="stream.chunk",
-                        payload={"index": chunk_index, "text": chunk},
-                    )
-                    chunk_index += 1
-                    yield StreamEvent(kind="chunk", text=chunk)
-                    prepared_state["response_text"] = str(prepared_state.get("response_text", "")) + chunk
-                if yielded:
-                    final_state = dict(prepared_state)
-                    final_state["messages"] = list(prepared_state.get("messages", [])) + [
-                        {"role": "assistant", "content": str(prepared_state.get("response_text", ""))}
-                    ]
-                    final_state["last_error"] = ""
-                    final_state["usage"] = {}
-                    result = self._persist_final_state(
-                        thread_id=thread_id,
-                        final_state=final_state,
-                        trace_context=run_context,
-                    )
-                    final_payload = {
-                        "response_text": result.response_text,
-                        "last_error": result.last_error,
-                        "usage": result.usage,
-                        "checkpoint_id": result.checkpoint_id,
-                    }
-                    _safe_record_event(
-                        self.tracer,
-                        run_context,
-                        name="runtime.result",
-                        payload=final_payload,
-                        status="ok",
-                    )
-                    _safe_finish_run(self.tracer, run_context, status="ok", output=final_payload)
-                    yield StreamEvent(kind="result", result=result)
-                    return
-            except Exception:
-                pass
+                from miniclaw.prompting.context import prompt_trace_scope
+                with prompt_trace_scope(tracer=self.tracer, context=run_context):
+                    result_holder[0] = app.invoke(initial_state, config)
+            except Exception as exc:
+                error_holder[0] = exc
+            finally:
+                event_queue.put(None)
 
-        yield from self._run_status_stream_fallback(
+        thread = Thread(target=run_graph, daemon=True)
+        thread.start()
+
+        while True:
+            event = event_queue.get()
+            if event is None:
+                break
+            yield event
+
+        thread.join()
+
+        if error_holder[0] is not None:
+            final_output = {"error": str(error_holder[0])}
+            _safe_finish_run(self.tracer, run_context, status="error", output=final_output)
+            yield StreamEvent(
+                kind="result",
+                result=TurnResult(
+                    thread_id=thread_id,
+                    response_text="",
+                    last_error=str(error_holder[0]),
+                    usage={},
+                ),
+            )
+            return
+
+        result_state = result_holder[0] or {}
+        snapshot = app.get_state(config)
+        checkpoint_id = None
+        if snapshot is not None:
+            checkpoint_id = snapshot.config.get("configurable", {}).get("checkpoint_id")
+
+        turn_result = TurnResult(
             thread_id=thread_id,
-            prepared_state=prepared_state,
-            run_context=run_context,
-            provider=traced_provider,
-            tool_registry=traced_registry,
+            response_text=str(result_state.get("response_text", "")),
+            last_error=str(result_state.get("last_error", "")),
+            usage=result_state.get("usage", {}),
+            checkpoint_id=str(checkpoint_id) if checkpoint_id is not None else None,
         )
-
-    def _run_status_stream_fallback(
-        self,
-        *,
-        thread_id: str,
-        prepared_state: dict[str, Any],
-        run_context: TraceContext,
-        provider: object,
-        tool_registry: object | None,
-    ) -> Iterator[StreamEvent]:
-        from miniclaw.runtime import nodes as runtime_nodes
-
-        max_rounds = self.settings.max_tool_rounds
-        max_errors = self.settings.max_consecutive_tool_errors
-        max_result_chars = self.settings.max_tool_result_chars
-        debug = getattr(self.settings, "debug", False)
-
-        loop_state = dict(prepared_state)
-        usage: RuntimeUsage = {}
-        final_state: dict[str, Any] | None = None
-        consecutive_errors = 0
-        tool_history: list[dict[str, str]] = []  # accumulated tool call records
-
-        try:
-            for iteration in range(max_rounds):
-                messages = self._build_provider_messages(loop_state, trace_context=run_context)
-                visible_tools = runtime_nodes._build_provider_tools(
-                    tool_registry,
-                    runtime_nodes._coerce_active_capabilities(loop_state.get("active_capabilities")),
-                )
-                response = runtime_nodes._run_provider_sync(
-                    runtime_nodes._invoke_provider(
-                        provider,
-                        messages,
-                        model=self.settings.model,
-                        tools=visible_tools,
-                    )
-                )
-                usage = runtime_nodes._merge_usage(usage, response)
-
-                if not response.tool_calls:
-                    # Final response — no more tool calls
-                    final_state = runtime_nodes._finish_response(loop_state, response, usage)
-                    final_text = str(final_state.get("response_text", ""))
-                    if final_text:
-                        yield StreamEvent(kind="chunk", text=final_text)
-                    break
-
-                # Model returned tool calls — yield model's intermediate text + tool info
-                model_text = str(response.content or "").strip()
-                if model_text:
-                    yield StreamEvent(kind="model_text", text=model_text)
-
-                # Yield tool_calling events for each tool call
-                for raw_call in response.tool_calls:
-                    function = raw_call.get("function", {})
-                    tool_name = str(function.get("name", "")).strip() or "tool"
-                    tool_args = function.get("arguments", {})
-                    if isinstance(tool_args, str):
-                        try:
-                            import json as _json
-                            tool_args = _json.loads(tool_args)
-                        except Exception:
-                            tool_args = {"raw": tool_args}
-                    yield StreamEvent(
-                        kind="tool_calling",
-                        text=tool_name,
-                        metadata={"tool_name": tool_name, "arguments": tool_args if debug else None},
-                    )
-
-                # Execute tool calls
-                loop_state = runtime_nodes._apply_tool_calls(
-                    loop_state, response, tool_registry, max_result_chars=max_result_chars,
-                )
-
-                # Extract tool results and yield tool_done events
-                tool_messages = [
-                    msg for msg in loop_state.get("messages", [])
-                    if (msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "")) == "tool"
-                ]
-                recent_tool_msgs = tool_messages[-len(response.tool_calls):] if response.tool_calls else []
-                for i, raw_call in enumerate(response.tool_calls):
-                    function = raw_call.get("function", {})
-                    tool_name = str(function.get("name", "")).strip() or "tool"
-                    tool_args = function.get("arguments", {})
-                    if isinstance(tool_args, str):
-                        try:
-                            import json as _json
-                            tool_args = _json.loads(tool_args)
-                        except Exception:
-                            tool_args = {"raw": tool_args}
-                    tool_result_text = ""
-                    if i < len(recent_tool_msgs):
-                        msg = recent_tool_msgs[i]
-                        tool_result_text = msg.get("content", "") if isinstance(msg, dict) else str(getattr(msg, "content", ""))
-                    record = {"tool_name": tool_name}
-                    if debug:
-                        record["arguments"] = str(tool_args)
-                        record["result"] = tool_result_text[:500]
-                    tool_history.append(record)
-                    yield StreamEvent(
-                        kind="tool_done",
-                        text=tool_name,
-                        metadata={
-                            "tool_name": tool_name,
-                            "arguments": tool_args if debug else None,
-                            "result": tool_result_text[:500] if debug else None,
-                        },
-                    )
-
-                # Check consecutive errors
-                if recent_tool_msgs and runtime_nodes._is_error_content(recent_tool_msgs[-1]):
-                    consecutive_errors += 1
-                    if consecutive_errors >= max_errors:
-                        final_state = runtime_nodes._error_state(
-                            loop_state,
-                            f"tool call failed {max_errors} consecutive times",
-                            usage,
-                        )
-                        break
-                else:
-                    consecutive_errors = 0
-
-            if final_state is None:
-                final_state = runtime_nodes._error_state(
-                    loop_state,
-                    f"tool loop round limit reached after {max_rounds} rounds",
-                    usage,
-                )
-        except Exception as exc:
-            final_state = runtime_nodes._error_state(loop_state, runtime_nodes._format_error(exc), usage)
-
-        result = self._persist_final_state(
+        self._remember_turn(
             thread_id=thread_id,
-            final_state=final_state,
+            user_input=user_input,
+            result=turn_result,
             trace_context=run_context,
         )
-        final_status = "error" if result.last_error else "ok"
+        final_status = "error" if turn_result.last_error else "ok"
         _safe_finish_run(self.tracer, run_context, status=final_status, output={
-            "response_text": result.response_text,
-            "last_error": result.last_error,
+            "response_text": turn_result.response_text,
+            "last_error": turn_result.last_error,
         })
-        yield StreamEvent(kind="result", result=result, metadata={"tool_history": tool_history})
+        yield StreamEvent(kind="result", result=turn_result)
 
     def resume_thread(self, *, thread_id: str) -> ResumeResult | None:
-        checkpointer = AsyncSQLiteCheckpointer(self.settings.sqlite_path)
-        checkpoint = checkpointer.get_tuple({"configurable": {"thread_id": thread_id}})
+        checkpoint = self._checkpointer.get_tuple({"configurable": {"thread_id": thread_id}})
         if checkpoint is None:
             return None
 
@@ -532,17 +428,13 @@ class RuntimeService:
         )
 
     def reset_thread(self, *, thread_id: str) -> None:
-        checkpointer = AsyncSQLiteCheckpointer(self.settings.sqlite_path)
-        checkpointer.delete_thread(thread_id)
+        self._checkpointer.delete_thread(thread_id)
         if self.thread_control_store is not None:
             self.thread_control_store.clear(thread_id)
-        prune = getattr(self.memory_store, "prune", None)
-        if callable(prune):
-            prune(thread_id)
+        self.memory_store.prune(thread_id)
 
     def _extract_latest_user_turn(self, *, thread_id: str) -> tuple[str, list[dict[str, object]]]:
-        checkpointer = AsyncSQLiteCheckpointer(self.settings.sqlite_path)
-        checkpoint = checkpointer.get_tuple({"configurable": {"thread_id": thread_id}})
+        checkpoint = self._checkpointer.get_tuple({"configurable": {"thread_id": thread_id}})
         if checkpoint is None:
             raise RuntimeError(f"no checkpoint found for thread={thread_id}")
 
@@ -567,10 +459,10 @@ class RuntimeService:
             role = message.get("role")
             return (str(role) if role is not None else None), message.get("content", ""), content_parts
 
-        raw_parts = getattr(message, "content_parts", [])
+        raw_parts = message.content_parts if hasattr(message, "content_parts") else []
         content_parts = [dict(part) for part in raw_parts if isinstance(part, dict)]
-        role = getattr(message, "role", None)
-        content = getattr(message, "content", "")
+        role = message.role if hasattr(message, "role") else None
+        content = message.content if hasattr(message, "content") else ""
         return (str(role) if role is not None else None), content, content_parts
 
     @staticmethod
@@ -634,96 +526,6 @@ class RuntimeService:
             "suggested_capabilities": list(snapshot_values.get("suggested_capabilities", [])),
         }
 
-    def _prepare_stream_state(
-        self,
-        *,
-        thread_id: str,
-        user_input: str,
-        runtime_metadata: Mapping[str, object] | None,
-        user_content_parts: list[dict[str, object]] | None,
-    ) -> dict[str, Any]:
-        checkpointer = AsyncSQLiteCheckpointer(self.settings.sqlite_path)
-        config = {"configurable": {"thread_id": thread_id}}
-        graph = build_graph(
-            settings=self.settings,
-            provider=self.provider,
-            mini_provider=self.mini_provider,
-            memory_store=self.memory_store,
-            tool_registry=self.tool_registry,
-        )
-        app = graph.compile(checkpointer=checkpointer)
-        snapshot = app.get_state(config)
-        snapshot_values = snapshot.values if snapshot is not None else {}
-        state = self._build_initial_state(
-            thread_id=thread_id,
-            user_input=user_input,
-            runtime_metadata=runtime_metadata,
-            user_content_parts=user_content_parts,
-            snapshot_values=snapshot_values,
-        )
-        from miniclaw.runtime.nodes import ingest
-
-        state.update(ingest(state))
-        thread_runtime_metadata = state["runtime_metadata"]
-        state["memory_context"] = build_memory_context(
-            self.memory_store,
-            str(thread_runtime_metadata.get("thread_id", thread_id)),
-        )
-        return state
-
-    def _build_provider_messages(
-        self,
-        state: Mapping[str, Any],
-        *,
-        trace_context: TraceContext | None = None,
-    ) -> list[Any]:
-        context_builder = ContextBuilder(
-            system_prompt=self.settings.system_prompt,
-            skills_loader=self.tool_registry.skill_loader if self.tool_registry is not None else None,
-            tool_registry=self.tool_registry,
-            mcp_registry=self.tool_registry.mcp_registry if self.tool_registry is not None else None,
-            history_char_budget=getattr(self.settings, "history_char_budget", None),
-            compress_keep_recent_turns=getattr(self.settings, "compress_keep_recent_turns", None),
-            compress_turn_summary_chars=getattr(self.settings, "compress_turn_summary_chars", None),
-        )
-        if trace_context is None:
-            messages = context_builder.build_provider_messages(state)
-        else:
-            with prompt_trace_scope(tracer=self.tracer, context=trace_context):
-                messages = context_builder.build_provider_messages(state)
-
-        compression_summary = getattr(context_builder, "_last_compression_summary", "")
-        if compression_summary and self.memory_file_store is not None:
-            thread_id = str(state.get("thread_id", ""))
-            if thread_id and thread_id not in self._compression_synced_threads:
-                self._compression_synced_threads.add(thread_id)
-                self._sync_compression_to_memory(
-                    thread_id=thread_id,
-                    summary=compression_summary,
-                    trace_context=trace_context,
-                )
-
-        return messages
-
-    def _sync_compression_to_memory(
-        self,
-        *,
-        thread_id: str,
-        summary: str,
-        trace_context: TraceContext | None = None,
-    ) -> None:
-        thread_key = f"thread:{thread_id}"
-        try:
-            self.memory_file_store.append_recent_work(thread_key, summary)
-            _safe_record_event(
-                self.tracer,
-                trace_context,
-                name="memory.compression_sync",
-                payload={"thread_id": thread_id, "summary_length": len(summary)},
-            )
-        except Exception:
-            pass
-
     def _persist_final_state(
         self,
         *,
@@ -731,15 +533,9 @@ class RuntimeService:
         final_state: dict[str, Any],
         trace_context: TraceContext | None = None,
     ) -> TurnResult:
-        checkpointer = AsyncSQLiteCheckpointer(self.settings.sqlite_path)
-        graph = StateGraph(RuntimeState)
-        graph.add_node("persist", lambda state: state)
-        graph.add_edge(START, "persist")
-        graph.add_edge("persist", END)
-        app = graph.compile(checkpointer=checkpointer)
         config = {"configurable": {"thread_id": thread_id}}
-        result = app.invoke(dict(final_state), config)
-        snapshot = app.get_state(config)
+        result = self._persist_app.invoke(dict(final_state), config)
+        snapshot = self._persist_app.get_state(config)
         checkpoint_id = None
         if snapshot is not None:
             checkpoint_id = snapshot.config.get("configurable", {}).get("checkpoint_id")
@@ -766,9 +562,7 @@ class RuntimeService:
         result: TurnResult,
         trace_context: TraceContext | None = None,
     ) -> None:
-        append_fact = getattr(self.memory_store, "append_fact", None)
-        if not callable(append_fact):
-            return
+        append_fact = self.memory_store.append_fact
 
         memory_span = None
         if trace_context is not None:
@@ -925,7 +719,7 @@ class RuntimeService:
         if not summaries:
             return
         settings = self.settings
-        runtime_dir = getattr(settings, "runtime_dir", None)
+        runtime_dir = settings.runtime_dir
         if runtime_dir is None:
             return
 
@@ -945,25 +739,17 @@ class RuntimeService:
             f.write(section)
 
         if self.memory_indexer is not None:
-            mark_dirty = getattr(self.memory_indexer, "mark_dirty", None)
-            if callable(mark_dirty):
-                mark_dirty(f"{today}.md")
+            self.memory_indexer.mark_dirty(f"{today}.md")
 
     def _list_recent_durable_facts(self, thread_id: str, *, limit: int) -> list[MemoryItem]:
         items = self._list_recent_items(thread_id, limit=limit)
         return [item for item in items if item.kind in DURABLE_MEMORY_KINDS]
 
     def _list_recent_by_kind(self, thread_id: str, kind: str, *, limit: int) -> list[MemoryItem]:
-        list_recent_by_kind = getattr(self.memory_store, "list_recent_by_kind", None)
-        if callable(list_recent_by_kind):
-            return list_recent_by_kind(thread_id, kind, limit)
-        return [item for item in self._list_recent_items(thread_id, limit=limit * 3) if item.kind == kind][:limit]
+        return self.memory_store.list_recent_by_kind(thread_id, kind, limit)
 
     def _list_recent_items(self, thread_id: str, *, limit: int) -> list[MemoryItem]:
-        list_recent = getattr(self.memory_store, "list_recent", None)
-        if not callable(list_recent):
-            return []
-        return list_recent(thread_id, limit)
+        return self.memory_store.list_recent(thread_id, limit)
 
     def _extract_durable_facts(
         self,
@@ -1140,11 +926,13 @@ def _safe_start_span(
     *,
     name: str,
     metadata: Mapping[str, Any] | None = None,
+    inputs: Mapping[str, Any] | None = None,
+    run_type: str | None = None,
 ) -> TraceContext | None:
     if parent is None:
         return None
     try:
-        return tracer.start_span(parent, name=name, metadata=metadata)
+        return tracer.start_span(parent, name=name, metadata=metadata, inputs=inputs, run_type=run_type)
     except Exception:
         return NoopTracer().start_span(parent, name=name, metadata=metadata)
 
@@ -1155,11 +943,12 @@ def _safe_finish_span(
     *,
     status: str,
     output: Mapping[str, Any] | None = None,
+    outputs: Mapping[str, Any] | None = None,
 ) -> None:
     if context is None:
         return
     try:
-        tracer.finish_span(context, status=status, output=output)
+        tracer.finish_span(context, status=status, output=output, outputs=outputs)
     except Exception:
         return
 
@@ -1198,11 +987,11 @@ def _wrap_tool_registry(
 
 
 class _TracingProviderProxy:
-    def __init__(self, *, provider: object, tracer: object, parent_context: TraceContext) -> None:
+    def __init__(self, *, provider: ChatProvider, tracer: object, parent_context: TraceContext) -> None:
         self._provider = provider
         self._tracer = tracer
         self._parent_context = parent_context
-        self.capabilities = getattr(provider, "capabilities", None)
+        self.capabilities = provider.capabilities if hasattr(provider, "capabilities") else None
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._provider, name)
@@ -1214,54 +1003,25 @@ class _TracingProviderProxy:
         model: str | None = None,
         tools: list[dict[str, Any]] | None = None,
     ):
+        request_data = {
+            "messages": _serialize_messages(messages),
+            "model": model,
+            "tools": [dict(tool) for tool in tools or []],
+        }
         span = _safe_start_span(
             self._tracer,
             self._parent_context,
             name="provider.chat",
-            metadata={
-                "model": model,
-                "message_count": len(messages),
-                "tool_count": len(tools or []),
-            },
-        )
-        _safe_record_event(
-            self._tracer,
-            span or self._parent_context,
-            name="provider.request",
-            payload={
-                "messages": _serialize_messages(messages),
-                "model": model,
-                "tools": [dict(tool) for tool in tools or []],
-            },
+            metadata={"model": model, "message_count": len(messages), "tool_count": len(tools or [])},
+            inputs=request_data,
+            run_type="llm",
         )
         try:
             response = await self._provider.achat(messages, model=model, tools=tools)
         except Exception as exc:
-            _safe_record_event(
-                self._tracer,
-                span or self._parent_context,
-                name="provider.error",
-                payload={"error": str(exc)},
-                status="error",
-            )
             _safe_finish_span(self._tracer, span, status="error", output={"error": str(exc)})
             raise
-        _safe_record_event(
-            self._tracer,
-            span or self._parent_context,
-            name="provider.response",
-            payload=_serialize_response(response),
-        )
-        _safe_finish_span(
-            self._tracer,
-            span,
-            status="ok",
-            output={
-                "response_text": str(getattr(response, "content", "")),
-                "tool_call_count": len(getattr(response, "tool_calls", []) or []),
-                "usage": _serialize_usage(getattr(response, "usage", None)),
-            },
-        )
+        _safe_finish_span(self._tracer, span, status="ok", outputs=_serialize_response(response))
         return response
 
     async def astream_text(
@@ -1270,111 +1030,61 @@ class _TracingProviderProxy:
         *,
         model: str | None = None,
     ):
+        request_data = {
+            "messages": _serialize_messages(messages),
+            "model": model,
+        }
         span = _safe_start_span(
             self._tracer,
             self._parent_context,
             name="provider.stream",
             metadata={"model": model, "message_count": len(messages)},
+            inputs=request_data,
+            run_type="llm",
         )
-        _safe_record_event(
-            self._tracer,
-            span or self._parent_context,
-            name="provider.request",
-            payload={"messages": _serialize_messages(messages), "model": model},
-        )
-        chunk_count = 0
+        collected_text = ""
         try:
             async for chunk in self._provider.astream_text(messages, model=model):
-                _safe_record_event(
-                    self._tracer,
-                    span or self._parent_context,
-                    name="provider.stream.chunk",
-                    payload={"index": chunk_count, "text": str(chunk)},
-                )
-                chunk_count += 1
+                collected_text += str(chunk)
                 yield str(chunk)
         except Exception as exc:
-            _safe_record_event(
-                self._tracer,
-                span or self._parent_context,
-                name="provider.error",
-                payload={"error": str(exc)},
-                status="error",
-            )
             _safe_finish_span(self._tracer, span, status="error", output={"error": str(exc)})
             raise
-        _safe_finish_span(self._tracer, span, status="ok", output={"chunk_count": chunk_count})
+        _safe_finish_span(self._tracer, span, status="ok", outputs={"content": collected_text})
 
 
 class _TracingToolRegistryProxy:
-    def __init__(self, *, tool_registry: object, tracer: object, parent_context: TraceContext) -> None:
+    def __init__(self, *, tool_registry: ToolRegistry, tracer: object, parent_context: TraceContext) -> None:
         self._tool_registry = tool_registry
         self._tracer = tracer
         self._parent_context = parent_context
-        self.skill_loader = getattr(tool_registry, "skill_loader", None)
-        self.mcp_registry = getattr(tool_registry, "mcp_registry", None)
+        self.skill_loader = tool_registry.skill_loader
+        self.mcp_registry = tool_registry.mcp_registry
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._tool_registry, name)
 
-    def execute(self, call: object, active_capabilities: object | None = None):
-        tool_name = str(getattr(call, "name", "")).strip() or "tool"
-        arguments = dict(getattr(call, "arguments", {}) or {})
-        spec = None
-        get_tool = getattr(self._tool_registry, "get", None)
-        if callable(get_tool):
-            registered = get_tool(tool_name)
-            spec = getattr(registered, "spec", None)
+    def execute(self, call: ToolCall, active_capabilities: ActiveCapabilities | None = None) -> ToolResult:
+        tool_name = call.name.strip() or "tool"
+        registered = self._tool_registry.get(tool_name)
+        tool_source = registered.spec.source if registered is not None else None
         span = _safe_start_span(
             self._tracer,
             self._parent_context,
             name=f"tool.call.{tool_name}",
-            metadata={
-                "tool_name": tool_name,
-                "tool_source": getattr(spec, "source", None),
-            },
-        )
-        _safe_record_event(
-            self._tracer,
-            span or self._parent_context,
-            name="tool.call",
-            payload={
-                "tool_name": tool_name,
-                "tool_source": getattr(spec, "source", None),
-                "arguments": arguments,
-            },
+            metadata={"tool_name": tool_name, "tool_source": tool_source},
+            inputs={"tool_name": tool_name, "arguments": dict(call.arguments)},
         )
         try:
             result = self._tool_registry.execute(call, active_capabilities)
         except Exception as exc:
-            _safe_record_event(
-                self._tracer,
-                span or self._parent_context,
-                name="tool.error",
-                payload={"tool_name": tool_name, "error": str(exc)},
-                status="error",
-            )
             _safe_finish_span(self._tracer, span, status="error", output={"error": str(exc)})
             raise
-        _safe_record_event(
-            self._tracer,
-            span or self._parent_context,
-            name="tool.result",
-            payload={
-                "tool_name": tool_name,
-                "content": str(getattr(result, "content", "")),
-                "is_error": bool(getattr(result, "is_error", False)),
-                "metadata": dict(getattr(result, "metadata", {}) or {}),
-            },
-        )
         _safe_finish_span(
             self._tracer,
             span,
-            status="error" if bool(getattr(result, "is_error", False)) else "ok",
-            output={
-                "is_error": bool(getattr(result, "is_error", False)),
-                "content": str(getattr(result, "content", "")),
-            },
+            status="error" if result.is_error else "ok",
+            outputs={"content": result.content, "is_error": result.is_error, "metadata": dict(result.metadata)},
         )
         return result
 
@@ -1390,37 +1100,27 @@ def _serialize_messages(messages: list[Any]) -> list[dict[str, Any]]:
             continue
         serialized.append(
             {
-                "role": str(getattr(message, "role", "")),
-                "content": getattr(message, "content", None),
-                "content_parts": list(getattr(message, "content_parts", []) or []),
-                "tool_calls": list(getattr(message, "tool_calls", []) or []),
-                "name": getattr(message, "name", None),
-                "tool_call_id": getattr(message, "tool_call_id", None),
+                "role": str(message.role),
+                "content": message.content,
+                "content_parts": list(message.content_parts or []),
+                "tool_calls": list(message.tool_calls or []),
+                "name": message.name,
+                "tool_call_id": message.tool_call_id,
             }
         )
     return serialized
 
 
-def _serialize_response(response: object) -> dict[str, Any]:
+def _serialize_response(response: ChatResponse) -> dict[str, Any]:
     return {
-        "provider": str(getattr(response, "provider", "")),
-        "model": getattr(response, "model", None),
-        "content": str(getattr(response, "content", "")),
-        "content_parts": [dict(part) for part in getattr(response, "content_parts", []) or []],
-        "tool_calls": [dict(call) for call in getattr(response, "tool_calls", []) or []],
-        "usage": _serialize_usage(getattr(response, "usage", None)),
-        "raw": _normalize_mapping(getattr(response, "raw", {})),
+        "provider": response.provider,
+        "model": response.model,
+        "content": response.content,
+        "content_parts": [dict(part) for part in response.content_parts],
+        "tool_calls": [dict(call) for call in response.tool_calls],
+        "usage": response.usage.model_dump(exclude_none=True) if response.usage is not None else {},
+        "raw": dict(response.raw),
     }
-
-
-def _serialize_usage(usage: object) -> dict[str, Any]:
-    if usage is None:
-        return {}
-    if hasattr(usage, "model_dump"):
-        return usage.model_dump(exclude_none=True)
-    if isinstance(usage, Mapping):
-        return {str(key): value for key, value in usage.items()}
-    return {}
 
 
 def _normalize_mapping(value: object) -> dict[str, Any]:
@@ -1429,34 +1129,32 @@ def _normalize_mapping(value: object) -> dict[str, Any]:
     return {}
 
 
-def _iterate_async_iterator_sync(async_iterator) -> Iterator[str]:
-    from queue import Queue
-    from threading import Thread
+def _build_langchain_callbacks(tracer: object) -> list[Any]:
+    """Build LangChain callbacks for LangGraph node-level tracing.
 
-    queue: Queue[tuple[str, object | None]] = Queue()
+    When a LangSmithTracer is active, injects a LangChainTracer that records
+    each graph node's input/output state and duration as nested spans.
+    """
+    from miniclaw.observability.langsmith import LangSmithTracer
+    from miniclaw.observability.composite import CompositeTracer
 
-    async def produce() -> None:
-        try:
-            async for item in async_iterator:
-                queue.put(("chunk", str(item)))
-            queue.put(("done", None))
-        except Exception as exc:
-            queue.put(("error", exc))
+    tracers_to_check: list[object] = []
+    if isinstance(tracer, CompositeTracer):
+        tracers_to_check.extend(tracer._tracers)
+    else:
+        tracers_to_check.append(tracer)
 
-    def runner() -> None:
-        asyncio.run(produce())
+    for t in tracers_to_check:
+        if isinstance(t, LangSmithTracer):
+            try:
+                from langchain_core.tracers import LangChainTracer
 
-    thread = Thread(target=runner, daemon=True)
-    thread.start()
-    try:
-        while True:
-            kind, payload = queue.get()
-            if kind == "chunk":
-                yield str(payload)
-                continue
-            if kind == "done":
-                return
-            if kind == "error":
-                raise payload  # type: ignore[misc]
-    finally:
-        thread.join()
+                return [LangChainTracer(
+                    client=t.client,
+                    project_name=t.project,
+                )]
+            except ImportError:
+                return []
+    return []
+
+

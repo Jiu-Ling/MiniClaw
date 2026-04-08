@@ -99,6 +99,8 @@ class Tracer(Protocol):
         name: str,
         metadata: Mapping[str, Any] | None = None,
         context: TraceContext | None = None,
+        inputs: Mapping[str, Any] | None = None,
+        run_type: str | None = None,
     ) -> TraceContext: ...
 
     def finish_span(
@@ -108,6 +110,7 @@ class Tracer(Protocol):
         status: str,
         output: Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
+        outputs: Mapping[str, Any] | None = None,
     ) -> None: ...
 
     def record_event(
@@ -157,6 +160,8 @@ class NoopTracer:
         name: str,
         metadata: Mapping[str, Any] | None = None,
         context: TraceContext | None = None,
+        inputs: Mapping[str, Any] | None = None,
+        run_type: str | None = None,
     ) -> TraceContext:
         return context or TraceContext(
             trace_id=parent.trace_id,
@@ -176,6 +181,7 @@ class NoopTracer:
         status: str,
         output: Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
+        outputs: Mapping[str, Any] | None = None,
     ) -> None:
         return None
 

@@ -71,24 +71,36 @@ class TelegramChannel:
         thread_id = self._extract_message_thread_id(msg.channel_id)
         reply_to = int(msg.reply_to) if msg.reply_to and msg.reply_to.isdigit() else None
 
-        kwargs: dict = {"chat_id": chat_id, "text": msg.text}
-        if thread_id:
-            kwargs["message_thread_id"] = thread_id
-        if reply_to:
-            kwargs["reply_to_message_id"] = reply_to
-        if msg.parse_mode:
-            kwargs["parse_mode"] = msg.parse_mode
+        chunks = _split_text(msg.text, self.Meta.max_message_length)
+        last_sent = None
+        for chunk in chunks:
+            kwargs: dict = {"chat_id": chat_id, "text": chunk}
+            if thread_id:
+                kwargs["message_thread_id"] = thread_id
+            if reply_to:
+                kwargs["reply_to_message_id"] = reply_to
+            if msg.parse_mode:
+                kwargs["parse_mode"] = msg.parse_mode
 
-        try:
-            sent = await self._bot.send_message(**kwargs)
-        except telegram.error.BadRequest:
-            kwargs.pop("parse_mode", None)
-            sent = await self._bot.send_message(**kwargs)
+            try:
+                last_sent = await self._bot.send_message(**kwargs)
+            except telegram.error.BadRequest:
+                kwargs.pop("parse_mode", None)
+                last_sent = await self._bot.send_message(**kwargs)
+            # Only reply_to the first chunk
+            reply_to = None
 
-        return SentMessage(message_id=str(sent.message_id), channel_id=msg.channel_id)
+        return SentMessage(
+            message_id=str(last_sent.message_id) if last_sent else "",
+            channel_id=msg.channel_id,
+        )
 
     async def edit_message(self, channel_id: str, message_id: str, text: str) -> None:
         chat_id = self._to_chat_id(channel_id)
+        # edit_message can only update a single message; truncate if too long
+        limit = self.Meta.max_message_length
+        if len(text) > limit:
+            text = text[: limit - 20] + "\n\n...(truncated)"
         try:
             await self._bot.edit_message_text(
                 chat_id=chat_id, message_id=int(message_id),
@@ -262,3 +274,40 @@ class TelegramChannel:
         if len(parts) >= 2 and parts[1].isdigit():
             return int(parts[1])
         return None
+
+
+def _split_text(text: str, limit: int) -> list[str]:
+    """Split text into chunks that fit within the Telegram message limit.
+
+    Tries to break at paragraph boundaries (double newline), then single
+    newlines, then hard-cuts at the limit.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+
+        # Try to find a paragraph break
+        cut = remaining.rfind("\n\n", 0, limit)
+        if cut > limit // 4:
+            chunks.append(remaining[:cut].rstrip())
+            remaining = remaining[cut:].lstrip("\n")
+            continue
+
+        # Try a single newline
+        cut = remaining.rfind("\n", 0, limit)
+        if cut > limit // 4:
+            chunks.append(remaining[:cut].rstrip())
+            remaining = remaining[cut:].lstrip("\n")
+            continue
+
+        # Hard cut
+        chunks.append(remaining[:limit])
+        remaining = remaining[limit:]
+
+    return [c for c in chunks if c]

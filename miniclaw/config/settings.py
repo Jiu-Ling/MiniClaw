@@ -105,6 +105,9 @@ class Settings(BaseSettings):
     # Heartbeat
     heartbeat_interval_s: int = 900
 
+    # Prompt caching (DashScope cache_control: ephemeral)
+    enable_prompt_cache: bool = False
+
     # Mini model — shared by classify intent + heartbeat judgment
     mini_model: str | None = None
     mini_model_base_url: str | None = None

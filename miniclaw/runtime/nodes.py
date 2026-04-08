@@ -13,11 +13,12 @@ from miniclaw.providers.contracts import ChatMessage, ChatProvider, ChatResponse
 from miniclaw.prompting import ContextBuilder
 from miniclaw.runtime.state import ActiveCapabilities, RuntimeMessage, RuntimeState, RuntimeUsage
 from miniclaw.runtime.workers import WorkerManager
-from miniclaw.tools.contracts import ToolCall
+from miniclaw.tools.contracts import ToolCall, ToolResult
 from miniclaw.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
     from miniclaw.config.settings import Settings
+    from miniclaw.memory.indexer import MemoryIndexer
 
 MAX_TOOL_ROUNDS = 16
 MAX_CONSECUTIVE_ERRORS = 4
@@ -247,8 +248,8 @@ def _extract_last_turn_summary(messages: list) -> str:
     last_user = ""
     last_assistant = ""
     for msg in reversed(messages):
-        role = msg.get("role", "") if isinstance(msg, dict) else str(getattr(msg, "role", ""))
-        content = msg.get("content", "") if isinstance(msg, dict) else str(getattr(msg, "content", ""))
+        role = msg.get("role", "") if isinstance(msg, dict) else msg.role
+        content = msg.get("content", "") if isinstance(msg, dict) else msg.content
         if role == "assistant" and not last_assistant:
             last_assistant = str(content)[:200]
         elif role == "user" and not last_user:
@@ -293,15 +294,13 @@ def make_load_context(
     memory_store: object,
     *,
     retriever: object | None = None,
-    indexer: object | None = None,
+    indexer: MemoryIndexer | None = None,
     memory_token_budget: int = 2000,
 ) -> Callable[[RuntimeState], RuntimeState]:
     def load_context(state: RuntimeState) -> RuntimeState:
         # Flush dirty index entries synchronously
         if indexer is not None:
-            flush = getattr(indexer, "flush_dirty", None)
-            if callable(flush):
-                _run_provider_sync(flush())
+            _run_provider_sync(indexer.flush_dirty())
 
         runtime_metadata = state.get("runtime_metadata") or {}
         thread_id = _resolve_thread_id(state, runtime_metadata)
@@ -440,6 +439,7 @@ def make_agent(
     settings: Settings,
     provider: ChatProvider,
     tool_registry: ToolRegistry | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> Callable[[RuntimeState], RuntimeState]:
     context_builder = ContextBuilder(
         system_prompt=settings.system_prompt,
@@ -447,12 +447,16 @@ def make_agent(
         tool_registry=tool_registry,
         mcp_registry=tool_registry.mcp_registry if tool_registry is not None else None,
         history_char_budget=settings.history_char_budget,
-        max_history_messages=getattr(settings, "max_history_messages", None),
+        max_history_messages=settings.max_history_messages,
     )
 
     max_rounds = settings.max_tool_rounds
     max_errors = settings.max_consecutive_tool_errors
     max_result_chars = settings.max_tool_result_chars
+
+    def _emit(kind: str, **kwargs: Any) -> None:
+        if on_event is not None:
+            on_event({"kind": kind, **kwargs})
 
     def agent(state: RuntimeState) -> RuntimeState:
         loop_state = dict(state)
@@ -474,14 +478,47 @@ def make_agent(
                 )
                 usage = _merge_usage(usage, response)
                 if not response.tool_calls:
-                    return _finish_response(loop_state, response, usage)
+                    final = _finish_response(loop_state, response, usage)
+                    _emit("chunk", text=str(final.get("response_text", "")))
+                    return final
+
+                model_text = str(response.content or "").strip()
+                if model_text:
+                    _emit("model_text", text=model_text)
+
+                for raw_call in response.tool_calls:
+                    fn = raw_call.get("function", {})
+                    tool_name = str(fn.get("name", ""))
+                    tool_args = fn.get("arguments", {})
+                    if isinstance(tool_args, str):
+                        try:
+                            tool_args = json.loads(tool_args)
+                        except Exception:
+                            tool_args = {"raw": tool_args}
+                    _emit("tool_calling", text=tool_name, tool_name=tool_name, arguments=tool_args)
 
                 loop_state = _apply_tool_calls(loop_state, response, tool_registry, max_result_chars=max_result_chars)
 
                 last_tool_messages = [
                     msg for msg in loop_state.get("messages", [])
-                    if getattr(msg, "role", None) == "tool"
+                    if (msg.get("role") if isinstance(msg, dict) else msg.role) == "tool"
                 ]
+                recent_tool_msgs = last_tool_messages[-len(response.tool_calls):] if response.tool_calls else []
+                for i, raw_call in enumerate(response.tool_calls):
+                    fn = raw_call.get("function", {})
+                    tool_name = str(fn.get("name", ""))
+                    tool_args = fn.get("arguments", {})
+                    if isinstance(tool_args, str):
+                        try:
+                            tool_args = json.loads(tool_args)
+                        except Exception:
+                            tool_args = {"raw": tool_args}
+                    result_text = ""
+                    if i < len(recent_tool_msgs):
+                        msg = recent_tool_msgs[i]
+                        result_text = str(msg.get("content", "") if isinstance(msg, dict) else msg.content)
+                    _emit("tool_done", text=tool_name, tool_name=tool_name, arguments=tool_args, result=result_text[:500])
+
                 if last_tool_messages and _is_error_content(last_tool_messages[-1]):
                     consecutive_errors += 1
                     if consecutive_errors >= max_errors:
@@ -509,8 +546,9 @@ def make_executor(
     settings: Settings,
     provider: ChatProvider,
     tool_registry: ToolRegistry | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> Callable[[RuntimeState], RuntimeState]:
-    agent = make_agent(settings=settings, provider=provider, tool_registry=tool_registry)
+    agent = make_agent(settings=settings, provider=provider, tool_registry=tool_registry, on_event=on_event)
     worker_manager = WorkerManager(
         provider=provider,
         settings=settings,
@@ -837,9 +875,9 @@ def _parse_tool_arguments(name: str, raw_arguments: Any) -> dict[str, Any]:
     return parsed
 
 
-def _is_error_content(message: object) -> bool:
-    content = getattr(message, "content", None) or ""
-    return str(content).startswith("ERROR: ")
+def _is_error_content(message: RuntimeMessage | dict[str, Any]) -> bool:
+    content = message.get("content", "") if isinstance(message, dict) else message.content
+    return str(content or "").startswith("ERROR: ")
 
 
 def _finish_response(
@@ -904,11 +942,9 @@ def _coerce_active_capabilities(value: Any) -> ActiveCapabilities:
 
 def _apply_activation_result(
     active_capabilities: ActiveCapabilities,
-    result: object,
+    result: ToolResult,
 ) -> ActiveCapabilities:
-    metadata = getattr(result, "metadata", {})
-    if not isinstance(metadata, dict):
-        return active_capabilities
+    metadata = result.metadata
 
     updated = active_capabilities.model_copy(deep=True)
     activation_type = str(metadata.get("activation_type", "")).strip()

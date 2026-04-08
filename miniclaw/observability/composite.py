@@ -61,10 +61,15 @@ class CompositeTracer:
         name: str,
         metadata: Mapping[str, Any] | None = None,
         context: TraceContext | None = None,
+        inputs: Mapping[str, Any] | None = None,
+        run_type: str | None = None,
     ) -> TraceContext:
         shared_context = context or build_span_context(parent, name=name, metadata=metadata)
         for tracer in self._tracers:
-            tracer.start_span(parent, name=name, metadata=metadata, context=shared_context)
+            tracer.start_span(
+                parent, name=name, metadata=metadata, context=shared_context,
+                inputs=inputs, run_type=run_type,
+            )
         if not self._tracers:
             return NoopTracer().start_span(parent, name=name, metadata=metadata)
         return shared_context
@@ -76,9 +81,10 @@ class CompositeTracer:
         status: str,
         output: Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
+        outputs: Mapping[str, Any] | None = None,
     ) -> None:
         for tracer in self._tracers:
-            tracer.finish_span(context, status=status, output=output, metadata=metadata)
+            tracer.finish_span(context, status=status, output=output, metadata=metadata, outputs=outputs)
 
     def record_event(
         self,

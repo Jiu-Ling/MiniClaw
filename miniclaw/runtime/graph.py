@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 from langgraph.graph import END, START, StateGraph
 
@@ -39,6 +40,7 @@ def build_graph(
     retriever: HybridRetriever | None = None,
     indexer: MemoryIndexer | None = None,
     memory_token_budget: int = 2000,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> StateGraph:
     graph = StateGraph(RuntimeState)
 
@@ -64,6 +66,7 @@ def build_graph(
         settings=settings,
         provider=provider,
         tool_registry=tool_registry,
+        on_event=on_event,
     ))
     graph.add_node("error_handler", error_handler)
     graph.add_node("complete", complete)

@@ -71,18 +71,20 @@ class ContextBuilder:
         self.compress_keep_recent_turns = compress_keep_recent_turns or _DEFAULT_KEEP_RECENT_TURNS
         self.compress_turn_summary_chars = compress_turn_summary_chars or _DEFAULT_TURN_SUMMARY_CHARS
         self.max_history_messages = max_history_messages or _DEFAULT_MAX_HISTORY_MESSAGES
+        self._last_compression_summary: str = ""
 
     def build_system_prompt(self, state: Mapping[str, Any] | None = None) -> str:
+        # Static parts first (stable prefix for cache), then dynamic parts
         sections = [self.system_prompt or self._build_default_system_prompt()]
         for bootstrap_file in self.bootstrap_loader.load():
             sections.append(self._format_bootstrap_file(bootstrap_file.name, bootstrap_file.content))
+        sections.extend(self._build_capability_sections(state))
+        # Dynamic parts last — memory and planner context change per call
         memory_context = self._resolve_memory_context(state)
         memory_section = render_memory_section(memory_context)
         if memory_section:
             sections.append(memory_section)
-
         sections.extend(self._build_planner_sections(state))
-        sections.extend(self._build_capability_sections(state))
 
         return "\n\n".join(section for section in sections if section)
 

@@ -76,8 +76,13 @@ class JsonlTracer:
         name: str,
         metadata: Mapping[str, Any] | None = None,
         context: TraceContext | None = None,
+        inputs: Mapping[str, Any] | None = None,
+        run_type: str | None = None,
     ) -> TraceContext:
         context = context or build_span_context(parent, name=name, metadata=metadata)
+        record_metadata = dict(metadata or {})
+        if run_type is not None:
+            record_metadata["run_type"] = run_type
         self._write_record(
             TraceRecord(
                 kind="span_start",
@@ -88,7 +93,8 @@ class JsonlTracer:
                 thread_id=context.thread_id,
                 channel=context.channel,
                 name=name,
-                metadata=dict(metadata or {}),
+                metadata=record_metadata,
+                payload=dict(inputs or {}),
             )
         )
         return context
@@ -100,7 +106,9 @@ class JsonlTracer:
         status: str,
         output: Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
+        outputs: Mapping[str, Any] | None = None,
     ) -> None:
+        resolved_output = dict(outputs) if outputs is not None else dict(output or {})
         self._write_record(
             TraceRecord(
                 kind="span_finish",
@@ -113,7 +121,7 @@ class JsonlTracer:
                 name=context.name or "",
                 status=status,
                 metadata=dict(metadata or {}),
-                output=dict(output or {}),
+                output=resolved_output,
             )
         )
 
