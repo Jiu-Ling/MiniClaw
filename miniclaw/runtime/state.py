@@ -33,23 +33,14 @@ class RuntimeUsage(TypedDict, total=False):
     total_tokens: int
 
 
-class PlannedTask(TypedDict):
-    id: str
-    title: str
-    kind: str
-    status: str
-    worker_role: str
-    parallel_group: str
-
-
-class WorkerRun(TypedDict, total=False):
-    id: str
-    task_id: str
+class FleetRun(TypedDict, total=False):
+    fleet_id: str
+    sub_id: str
     role: str
     status: str
     summary: str
-    result: str
-    error: str
+    rounds_used: int
+    usage: dict[str, int]
 
 
 class RuntimeState(TypedDict, total=False):
@@ -63,19 +54,11 @@ class RuntimeState(TypedDict, total=False):
     response_text: str
     usage: RuntimeUsage
     last_error: str
-    request_kind: str
-    needs_plan: bool
-    context_profile: str
     planner_context: str
     plan_summary: str
-    plan_steps: list[str]
-    tasks: list[PlannedTask]
-    worker_runs: list[WorkerRun]
-    orchestration_status: str
-    aggregated_worker_context: str
+    subagent_briefs: list[dict[str, Any]]
     executor_notes: str
-    execution_mode: str
-    suggested_capabilities: list[str]
+    fleet_runs: list[FleetRun]
     needs_clarification: bool
     clarification_reason: str
     route: str

@@ -21,7 +21,6 @@ from miniclaw.runtime.checkpoint import AsyncSQLiteCheckpointer
 from miniclaw.runtime.service import ResumeResult, RuntimeService
 from miniclaw.runtime.state import ActiveCapabilities
 from miniclaw.runtime.thread_control import SQLiteThreadControlStore
-from miniclaw.runtime.workers import WorkerManager
 from miniclaw.skills.loader import SkillLoader
 from miniclaw.tools.builtin.activation import (
     build_add_mcp_server_tool,
@@ -36,7 +35,7 @@ from miniclaw.tools.builtin.send import build_send_tool
 from miniclaw.tools.builtin.skills import build_list_skills_tool, build_load_skill_tool
 from miniclaw.tools.builtin.shell import build_shell_tool
 from miniclaw.tools.builtin.web import build_web_search_tool
-from miniclaw.tools.builtin.spawn_worker import build_spawn_worker_tool
+from miniclaw.tools.builtin.spawn_subagent import build_spawn_subagent_tool
 from miniclaw.tools.builtin.heartbeat_manage import build_manage_heartbeat_tool
 from miniclaw.tools.messaging import MessagingBridge
 from miniclaw.tools.search import SearchBackend, build_search_backend
@@ -94,9 +93,9 @@ def build_tool_registry(
         skill_loader=resolved_loader,
         mcp_registry=resolved_mcp_registry,
     )
-    worker_manager = WorkerManager(
+    spawn_subagent_tool = build_spawn_subagent_tool(
         provider=provider,
-        settings=settings,
+        settings=resolved_settings,
         tool_registry=registry,
         tracer=tracer,
     )
@@ -113,8 +112,8 @@ def build_tool_registry(
         build_shell_tool(workspace=resolved_workspace),
         build_web_search_tool(search_backend=resolved_search_backend),
         build_send_tool(messaging_bridge=messaging_bridge),
-        build_spawn_worker_tool(worker_manager=worker_manager),
     ]
+    builtin_tools.append(spawn_subagent_tool)
     if heartbeat_file is not None:
         builtin_tools.append(build_manage_heartbeat_tool(heartbeat_file=heartbeat_file))
     if retriever is not None:
@@ -128,6 +127,7 @@ def build_tool_registry(
         "shell", "read_file", "send", "web_search",
         "cron", "manage_heartbeat",
         "load_skill_tools", "load_mcp_tools",
+        "spawn_subagent",
     }
     for tool in builtin_tools:
         if tool.spec.name in _CORE_TOOLS:

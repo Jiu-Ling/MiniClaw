@@ -94,6 +94,7 @@ def build_manage_heartbeat_tool(*, heartbeat_file: Path) -> RegisteredTool:
                 "additionalProperties": False,
             },
             source="builtin",
+            metadata={"worker_visible": False},
         ),
         executor=execute,
     )

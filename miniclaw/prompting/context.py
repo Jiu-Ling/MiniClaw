@@ -73,20 +73,28 @@ class ContextBuilder:
         self.max_history_messages = max_history_messages or _DEFAULT_MAX_HISTORY_MESSAGES
         self._last_compression_summary: str = ""
 
-    def build_system_prompt(self, state: Mapping[str, Any] | None = None) -> str:
-        # Static parts first (stable prefix for cache), then dynamic parts
+    def _build_static_sections(self, state: Mapping[str, Any] | None = None) -> list[str]:
+        """Return prompt sections that are stable within a thread (cache-eligible)."""
         sections = [self.system_prompt or self._build_default_system_prompt()]
         for bootstrap_file in self.bootstrap_loader.load():
             sections.append(self._format_bootstrap_file(bootstrap_file.name, bootstrap_file.content))
         sections.extend(self._build_capability_sections(state))
-        # Dynamic parts last — memory and planner context change per call
+        return [s for s in sections if s]
+
+    def _build_dynamic_sections(self, state: Mapping[str, Any] | None = None) -> list[str]:
+        """Return prompt sections that change per turn (not cache-eligible)."""
+        sections: list[str] = []
         memory_context = self._resolve_memory_context(state)
         memory_section = render_memory_section(memory_context)
         if memory_section:
             sections.append(memory_section)
         sections.extend(self._build_planner_sections(state))
+        return [s for s in sections if s]
 
-        return "\n\n".join(section for section in sections if section)
+    def build_system_prompt(self, state: Mapping[str, Any] | None = None) -> str:
+        # Static parts first (stable prefix for cache), then dynamic parts
+        all_sections = self._build_static_sections(state) + self._build_dynamic_sections(state)
+        return "\n\n".join(all_sections)
 
     def build_provider_messages(self, state: Mapping[str, Any]) -> list[ChatMessage]:
         tracer = _PROMPT_TRACE_TRACER.get()
@@ -94,9 +102,21 @@ class ContextBuilder:
         span = self._trace_start_prompt_span(tracer, parent_context, state)
         messages: list[ChatMessage] = []
         try:
-            system_prompt = self.build_system_prompt(state)
-            if system_prompt:
-                messages.append(ChatMessage(role="system", content=system_prompt))
+            static_sections = self._build_static_sections(state)
+            dynamic_sections = self._build_dynamic_sections(state)
+            static_text = "\n\n".join(static_sections)
+            dynamic_text = "\n\n".join(dynamic_sections)
+            system_prompt = "\n\n".join(s for s in [static_text, dynamic_text] if s)
+
+            if static_text or dynamic_text:
+                system_parts: list[dict] = []
+                if static_text:
+                    system_parts.append(
+                        {"type": "text", "text": static_text, "cache_control": {"type": "ephemeral"}}
+                    )
+                if dynamic_text:
+                    system_parts.append({"type": "text", "text": dynamic_text})
+                messages.append(ChatMessage(role="system", content_parts=system_parts))
 
             runtime_metadata = self._resolve_runtime_metadata(state)
             runtime_metadata_block = render_runtime_metadata_block(runtime_metadata)
@@ -266,28 +286,41 @@ class ContextBuilder:
             return []
 
         sections: list[str] = []
+
+        # Preserve the existing Planner Context section (it's a separate concern from the plan)
         planner_context = state.get("planner_context")
         if isinstance(planner_context, str) and planner_context.strip():
             sections.append(f"## Planner Context\n{planner_context.strip()}")
 
-        plan_summary = state.get("plan_summary")
-        if isinstance(plan_summary, str) and plan_summary.strip():
-            sections.append(f"## Plan Summary\n{plan_summary.strip()}")
+        plan_summary = str(state.get("plan_summary", "") or "").strip()
+        briefs = state.get("subagent_briefs") or []
+        executor_notes = str(state.get("executor_notes", "") or "").strip()
 
-        plan_steps = state.get("plan_steps")
-        if isinstance(plan_steps, list) and plan_steps:
-            steps = [f"- {str(step).strip()}" for step in plan_steps if str(step).strip()]
-            if steps:
-                sections.append("## Plan Steps\n" + "\n".join(steps))
+        if not plan_summary and not briefs and not executor_notes:
+            return sections
 
-        executor_notes = state.get("executor_notes")
-        if isinstance(executor_notes, str) and executor_notes.strip():
-            sections.append(f"## Executor Notes\n{executor_notes.strip()}")
+        lines = ["## Recommended Plan"]
+        if plan_summary:
+            lines.append(plan_summary)
+        if briefs:
+            lines.append("")
+            lines.append("Suggested subagent briefs:")
+            for i, brief in enumerate(briefs):
+                if not isinstance(brief, Mapping):
+                    continue
+                role = str(brief.get("role", "")).strip() or "subagent"
+                task = str(brief.get("task", "")).strip()
+                expected = str(brief.get("expected_output", "")).strip()
+                depends = brief.get("depends_on") or []
+                dep_str = f" (after {', '.join(f'#{d}' for d in depends)})" if depends else ""
+                lines.append(f"{i}. [{role}]{dep_str} {task}")
+                if expected:
+                    lines.append(f"   expected: {expected}")
+        if executor_notes:
+            lines.append("")
+            lines.append(f"Notes: {executor_notes}")
 
-        aggregated_worker_context = state.get("aggregated_worker_context")
-        if isinstance(aggregated_worker_context, str) and aggregated_worker_context.strip():
-            sections.append(f"## Worker Context\n{aggregated_worker_context.strip()}")
-
+        sections.append("\n".join(lines))
         return sections
 
     @staticmethod

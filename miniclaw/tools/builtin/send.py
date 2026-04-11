@@ -47,6 +47,7 @@ def build_send_tool(*, messaging_bridge: MessagingBridge | None) -> RegisteredTo
                 "additionalProperties": False,
             },
             source="builtin",
+            metadata={"worker_visible": False},
         ),
         executor=execute,
     )

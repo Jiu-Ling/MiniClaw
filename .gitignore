@@ -28,3 +28,6 @@ uv.lock
 # OS
 .DS_Store
 Thumbs.db
+
+# Local docs (specs, plans, architecture notes)
+docs/

@@ -85,6 +85,7 @@ def build_cron_tool(*, cron_service: CronService | None) -> RegisteredTool:
                 "additionalProperties": False,
             },
             source="builtin",
+            metadata={"worker_visible": False},
         ),
         executor=execute,
     )

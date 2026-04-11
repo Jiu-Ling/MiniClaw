@@ -10,14 +10,14 @@ from miniclaw.runtime.nodes import (
     complete,
     error_handler,
     ingest,
+    make_agent,
     make_classify,
-    make_executor,
     make_load_context,
     make_planner,
     route_after_classify,
     route_after_load_context,
-    route_after_validate,
-    validate,
+    route_after_planner,
+    route_on_error,
 )
 from miniclaw.runtime.state import RuntimeState
 
@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from miniclaw.config.settings import Settings
     from miniclaw.memory.indexer import MemoryIndexer
     from miniclaw.memory.retriever import HybridRetriever
+    from miniclaw.observability.contracts import Tracer
     from miniclaw.persistence.memory_store import MemoryStore
     from miniclaw.providers.contracts import ChatProvider
     from miniclaw.tools.registry import ToolRegistry
@@ -32,15 +33,16 @@ if TYPE_CHECKING:
 
 def build_graph(
     *,
-    settings: Settings,
-    provider: ChatProvider,
-    mini_provider: ChatProvider | None = None,
-    memory_store: MemoryStore,
-    tool_registry: ToolRegistry | None = None,
-    retriever: HybridRetriever | None = None,
-    indexer: MemoryIndexer | None = None,
+    settings: "Settings",
+    provider: "ChatProvider",
+    mini_provider: "ChatProvider | None" = None,
+    memory_store: "MemoryStore",
+    tool_registry: "ToolRegistry | None" = None,
+    retriever: "HybridRetriever | None" = None,
+    indexer: "MemoryIndexer | None" = None,
     memory_token_budget: int = 2000,
     on_event: Callable[[dict[str, Any]], None] | None = None,
+    tracer: "Tracer | None" = None,
 ) -> StateGraph:
     graph = StateGraph(RuntimeState)
 
@@ -61,12 +63,12 @@ def build_graph(
         provider=provider,
         tool_registry=tool_registry,
     ))
-    graph.add_node("validate", validate)
-    graph.add_node("executor", make_executor(
+    graph.add_node("agent", make_agent(
         settings=settings,
         provider=provider,
         tool_registry=tool_registry,
         on_event=on_event,
+        tracer=tracer,
     ))
     graph.add_node("error_handler", error_handler)
     graph.add_node("complete", complete)
@@ -78,24 +80,26 @@ def build_graph(
     graph.add_conditional_edges("classify", route_after_classify, {
         "clarify": "clarify",
         "load_context": "load_context",
+        "error_handler": "error_handler",
     })
-
     graph.add_edge("clarify", "complete")
 
     graph.add_conditional_edges("load_context", route_after_load_context, {
-        "executor": "executor",
+        "agent": "agent",
         "planner": "planner",
-    })
-
-    graph.add_edge("planner", "validate")
-
-    graph.add_conditional_edges("validate", route_after_validate, {
-        "executor": "executor",
         "error_handler": "error_handler",
     })
 
-    graph.add_edge("executor", "complete")
+    graph.add_conditional_edges("planner", route_after_planner, {
+        "agent": "agent",
+        "error_handler": "error_handler",
+    })
+
+    graph.add_conditional_edges("agent", route_on_error("complete"), {
+        "complete": "complete",
+        "error_handler": "error_handler",
+    })
+
     graph.add_edge("error_handler", "complete")
     graph.add_edge("complete", END)
-
     return graph

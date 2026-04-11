@@ -33,6 +33,82 @@ telegram_app = typer.Typer(
 )
 app.add_typer(telegram_app, name="telegram")
 
+trace_app = typer.Typer(name="trace", help="Trace inspection commands.", add_completion=False)
+app.add_typer(trace_app, name="trace")
+
+
+@trace_app.command("tail")
+def trace_tail(
+    path: Path = typer.Argument(..., help="Trace JSONL file path"),
+    follow: bool = typer.Option(True, "--follow/--no-follow"),
+) -> None:
+    """Pretty-print a trace JSONL file with hierarchical indentation."""
+    import json
+    import time
+
+    if not path.exists():
+        typer.echo(f"trace file not found: {path}", err=True)
+        raise typer.Exit(1)
+
+    span_depth: dict[str, int] = {}
+
+    def _depth_for(rec: dict) -> int:
+        kind = rec.get("kind", "")
+        span_id = rec.get("span_id") or ""
+        parent = rec.get("parent_span_id")
+        if parent and parent in span_depth:
+            return span_depth[parent] + 1
+        if kind == "run_start":
+            return 0
+        return span_depth.get(span_id, 0)
+
+    def _print_record(rec: dict) -> None:
+        kind = rec.get("kind", "")
+        name = rec.get("name", "")
+        span_id = rec.get("span_id") or ""
+        depth = _depth_for(rec)
+        if kind in ("run_start", "span_start"):
+            span_depth[span_id] = depth
+        prefix = "  " * depth
+        marker = {
+            "run_start": "▶",
+            "run_finish": "■",
+            "span_start": "├",
+            "span_finish": "└",
+            "event": "•",
+        }.get(kind, "·")
+        status = rec.get("status", "")
+        suffix = f" [{status}]" if status else ""
+        typer.echo(f"{prefix}{marker} {name}{suffix}")
+
+    with path.open("r") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                _print_record(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+        if not follow:
+            return
+
+        try:
+            while True:
+                line = fh.readline()
+                if not line:
+                    time.sleep(0.2)
+                    continue
+                line = line.strip()
+                if line:
+                    try:
+                        _print_record(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+        except KeyboardInterrupt:
+            return
+
 
 @app.callback()
 def main() -> None:
@@ -305,6 +381,62 @@ def _build_heartbeat_notify(channel: TelegramChannel, settings: object):
         ))
 
     return _notify
+
+
+@app.command("graph")
+def graph_command(
+    fmt: str = typer.Option("mermaid", "--format", "-f", help="mermaid | ascii | png"),
+    output: Path | None = typer.Option(None, "--output", "-o", help="Output file path (for png)"),
+) -> None:
+    """Export the runtime graph topology."""
+    from unittest.mock import MagicMock
+
+    from miniclaw.runtime.graph import build_graph
+
+    # Build the graph with stub providers — the topology does not depend on
+    # provider behavior, so we can render it without real credentials.
+    from miniclaw.config.settings import Settings
+
+    settings = Settings(
+        api_key="stub",
+        base_url="https://stub.example.com/v1",
+        model="stub-model",
+        trace_mode="off",
+    )
+    stub_provider = MagicMock(name="StubProvider")
+    stub_memory = MagicMock(name="StubMemoryStore")
+    stub_memory.recent_messages.return_value = []
+
+    graph = build_graph(
+        settings=settings,
+        provider=stub_provider,
+        memory_store=stub_memory,
+        tool_registry=None,
+    )
+    drawable = graph.compile().get_graph()
+
+    if fmt == "mermaid":
+        typer.echo(drawable.draw_mermaid())
+    elif fmt == "ascii":
+        try:
+            typer.echo(drawable.draw_ascii())
+        except Exception as exc:
+            typer.echo(f"ASCII render failed: {exc}", err=True)
+            typer.echo("Hint: install grandalf or use --format mermaid", err=True)
+            raise typer.Exit(1)
+    elif fmt == "png":
+        try:
+            png_bytes = drawable.draw_mermaid_png()
+        except Exception as exc:
+            typer.echo(f"PNG render failed: {exc}", err=True)
+            typer.echo("Hint: install pyppeteer or use --format mermaid and pipe to mmdc", err=True)
+            raise typer.Exit(1)
+        target = output or Path("miniclaw-graph.png")
+        target.write_bytes(png_bytes)
+        typer.echo(f"Wrote {target}")
+    else:
+        typer.echo(f"Unknown format: {fmt}", err=True)
+        raise typer.Exit(2)
 
 
 def _render_checkpoint(checkpoint: object) -> None:

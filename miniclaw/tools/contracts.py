@@ -19,6 +19,7 @@ class ToolSpec(BaseModel):
     def _apply_metadata_defaults(self) -> "ToolSpec":
         metadata = dict(self.metadata)
         metadata.setdefault("discoverable", True)
+        metadata.setdefault("worker_visible", True)
         self.metadata = metadata
         return self
 

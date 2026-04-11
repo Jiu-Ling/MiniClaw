@@ -195,6 +195,7 @@ class RuntimeService:
             retriever=self.retriever,
             indexer=self.memory_indexer,
             memory_token_budget=self.settings.memory_token_budget,
+            tracer=self.tracer,
         )
         app = graph.compile(checkpointer=self._checkpointer)
         config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
@@ -247,21 +248,20 @@ class RuntimeService:
             trace_context=run_context,
         )
         final_status = "error" if turn_result.last_error else "ok"
+        fleet_runs = result.get("fleet_runs", [])
         final_output = {
             "response_text": turn_result.response_text,
             "last_error": turn_result.last_error,
             "usage": turn_result.usage,
             "checkpoint_id": turn_result.checkpoint_id,
-            "orchestration_status": str(result.get("orchestration_status", "")),
-            "worker_run_count": len(result.get("worker_runs", [])) if isinstance(result.get("worker_runs", []), list) else 0,
+            "fleet_run_count": len(fleet_runs) if isinstance(fleet_runs, list) else 0,
         }
         _safe_record_event(
             self.tracer,
             run_context,
-            name="orchestration.status",
+            name="fleet.status",
             payload={
-                "status": str(result.get("orchestration_status", "")),
-                "worker_run_count": len(result.get("worker_runs", [])) if isinstance(result.get("worker_runs", []), list) else 0,
+                "fleet_run_count": len(fleet_runs) if isinstance(fleet_runs, list) else 0,
             },
             status=final_status,
         )
@@ -320,6 +320,7 @@ class RuntimeService:
             indexer=self.memory_indexer,
             memory_token_budget=self.settings.memory_token_budget,
             on_event=on_event,
+            tracer=self.tracer,
         )
         app = graph.compile(checkpointer=self._checkpointer)
         config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
@@ -511,19 +512,11 @@ class RuntimeService:
             "response_text": "",
             "usage": {},
             "last_error": "",
-            "request_kind": str(snapshot_values.get("request_kind", "")),
-            "needs_plan": bool(snapshot_values.get("needs_plan", False)),
-            "context_profile": str(snapshot_values.get("context_profile", "")),
             "planner_context": str(snapshot_values.get("planner_context", "")),
             "plan_summary": str(snapshot_values.get("plan_summary", "")),
-            "plan_steps": list(snapshot_values.get("plan_steps", [])),
-            "tasks": list(snapshot_values.get("tasks", [])),
-            "worker_runs": list(snapshot_values.get("worker_runs", [])),
-            "orchestration_status": str(snapshot_values.get("orchestration_status", "")),
-            "aggregated_worker_context": str(snapshot_values.get("aggregated_worker_context", "")),
+            "subagent_briefs": list(snapshot_values.get("subagent_briefs", [])),
             "executor_notes": str(snapshot_values.get("executor_notes", "")),
-            "execution_mode": str(snapshot_values.get("execution_mode", "")),
-            "suggested_capabilities": list(snapshot_values.get("suggested_capabilities", [])),
+            "fleet_runs": list(snapshot_values.get("fleet_runs", [])),
         }
 
     def _persist_final_state(
