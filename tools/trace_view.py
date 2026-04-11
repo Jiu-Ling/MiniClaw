@@ -6,23 +6,43 @@
 """MiniClaw trace log visualizer.
 
 Reads a JSONL trace file produced by `miniclaw.observability.local.JsonlTracer`
-and renders it as a single self-contained interactive HTML page. No external
-dependencies — pure Python stdlib + inline HTML/CSS/JS.
+and renders it as either:
+
+  1. A self-contained interactive HTML page with all data embedded (static mode).
+  2. A live server that tails the trace file and pushes new records to the
+     browser via Server-Sent Events (serve mode).
+
+Pure Python stdlib — no runtime dependencies. Inline HTML/CSS/JS in the
+template. Dark/light theme toggle persisted in localStorage. Click any
+metadata / payload / output panel to pop a dialog with the full untruncated
+value.
 
 Usage:
+    # Static export (default): write .html next to input, open browser.
     python tools/trace_view.py                                  # reads ~/.miniclaw/traces/miniclaw.jsonl
-    python tools/trace_view.py path/to/trace.jsonl              # custom input
-    python tools/trace_view.py trace.jsonl -o out.html          # custom output
-    python tools/trace_view.py trace.jsonl --no-open            # don't auto-open browser
+    python tools/trace_view.py path/to/trace.jsonl
+    python tools/trace_view.py trace.jsonl -o out.html
+    python tools/trace_view.py trace.jsonl --no-open
 
-The generated HTML file embeds all trace data — shareable as a single file.
+    # Serve mode: start a live-updating HTTP server (reads default path,
+    # auto-tails the file, pushes new records to the browser over SSE).
+    python tools/trace_view.py --serve                          # default path, auto port
+    python tools/trace_view.py --serve --port 8787
+    python tools/trace_view.py path/to/trace.jsonl --serve
+
+The generated HTML file (static mode) embeds all trace data — shareable as
+a single file.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import queue
+import threading
+import time
 import webbrowser
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -268,116 +288,210 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>MiniClaw Trace Viewer</title>
 <style>
-* { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; background: #0d1117; color: #c9d1d9; font-size: 13px; }
-code, pre, .mono { font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; }
-a { color: #58a6ff; }
+/* ---- Theme variables ---- */
+:root {
+  --bg:         #0d1117;
+  --bg-panel:   #161b22;
+  --bg-sunken:  #0d1117;
+  --bg-hover:   #1f2937;
+  --bg-chip:    #21262d;
+  --bg-chip-2:  #30363d;
+  --fg:         #c9d1d9;
+  --fg-strong:  #f0f6fc;
+  --fg-muted:   #8b949e;
+  --fg-dim:     #6e7681;
+  --border:     #30363d;
+  --border-soft:#21262d;
+  --link:       #58a6ff;
+  --link-soft:  #1f6feb;
+  --accent:     #58a6ff;
+  --ok:         #3fb950;
+  --error:      #f85149;
+  --warn:       #d29922;
+  --role-r:     #79c0ff;
+  --role-e:     #ffa657;
+  --role-v:     #d2a8ff;
+  --span-graph: #58a6ff;
+  --span-agent: #7ee787;
+  --span-sub:   #d2a8ff;
+  --span-tool:  #ffa657;
+  --span-prov:  #a5d6ff;
+  --span-mem:   #f0883e;
+  --span-event: #e3b341;
+  --dialog-backdrop: rgba(0, 0, 0, 0.6);
+}
+:root[data-theme="light"] {
+  --bg:         #ffffff;
+  --bg-panel:   #f6f8fa;
+  --bg-sunken:  #ffffff;
+  --bg-hover:   #eaeef2;
+  --bg-chip:    #eaeef2;
+  --bg-chip-2:  #d0d7de;
+  --fg:         #1f2328;
+  --fg-strong:  #0d1117;
+  --fg-muted:   #656d76;
+  --fg-dim:     #848f99;
+  --border:     #d0d7de;
+  --border-soft:#eaeef2;
+  --link:       #0969da;
+  --link-soft:  #dbeafe;
+  --accent:     #0969da;
+  --ok:         #1a7f37;
+  --error:      #cf222e;
+  --warn:       #9a6700;
+  --role-r:     #0550ae;
+  --role-e:     #bc4c00;
+  --role-v:     #6639ba;
+  --span-graph: #0969da;
+  --span-agent: #1a7f37;
+  --span-sub:   #6639ba;
+  --span-tool:  #bc4c00;
+  --span-prov:  #0969da;
+  --span-mem:   #bc4c00;
+  --span-event: #9a6700;
+  --dialog-backdrop: rgba(30, 35, 40, 0.5);
+}
 
-header { display: flex; align-items: center; gap: 16px; padding: 10px 16px; border-bottom: 1px solid #30363d; background: #161b22; flex-wrap: wrap; }
-header h1 { margin: 0; font-size: 15px; font-weight: 600; color: #f0f6fc; }
-header .badge { padding: 2px 8px; background: #21262d; border-radius: 10px; font-size: 11px; color: #8b949e; }
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; background: var(--bg); color: var(--fg); font-size: 13px; transition: background 0.2s, color 0.2s; }
+code, pre, .mono { font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; }
+a { color: var(--link); }
+
+header { display: flex; align-items: center; gap: 16px; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--bg-panel); flex-wrap: wrap; }
+header h1 { margin: 0; font-size: 15px; font-weight: 600; color: var(--fg-strong); }
+header .badge { padding: 2px 8px; background: var(--bg-chip); border-radius: 10px; font-size: 11px; color: var(--fg-muted); }
+header .status-pill { padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+header .status-pill.live { background: var(--ok); color: #ffffff; }
+header .status-pill.paused { background: var(--warn); color: #ffffff; }
+header .status-pill.offline { background: var(--fg-dim); color: var(--bg); }
 header .search { flex: 1; min-width: 200px; }
-header .search input { width: 100%; padding: 6px 10px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #c9d1d9; font-size: 12px; }
-header .search input:focus { outline: none; border-color: #58a6ff; }
-header .filter-chip { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; background: #21262d; border: 1px solid #30363d; border-radius: 12px; cursor: pointer; font-size: 11px; user-select: none; }
-header .filter-chip.active { background: #1f6feb; border-color: #58a6ff; color: #f0f6fc; }
-header .filter-chip:hover { border-color: #58a6ff; }
+header .search input { width: 100%; padding: 6px 10px; background: var(--bg-sunken); border: 1px solid var(--border); border-radius: 6px; color: var(--fg); font-size: 12px; }
+header .search input:focus { outline: none; border-color: var(--accent); }
+header .filter-chip { display: inline-flex; align-items: center; gap: 4px; padding: 4px 8px; background: var(--bg-chip); border: 1px solid var(--border); border-radius: 12px; cursor: pointer; font-size: 11px; user-select: none; color: var(--fg); }
+header .filter-chip.active { background: var(--link-soft); border-color: var(--accent); color: var(--fg-strong); }
+header .filter-chip:hover { border-color: var(--accent); }
+header .icon-btn { cursor: pointer; background: var(--bg-chip); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; font-size: 14px; line-height: 1; color: var(--fg); user-select: none; }
+header .icon-btn:hover { border-color: var(--accent); }
 
 main { display: grid; grid-template-columns: 220px 1fr 380px; height: calc(100vh - 50px - 180px); overflow: hidden; }
-aside.traces { border-right: 1px solid #30363d; overflow-y: auto; background: #0d1117; }
-aside.traces .trace-item { padding: 10px 12px; border-bottom: 1px solid #21262d; cursor: pointer; }
-aside.traces .trace-item:hover { background: #161b22; }
-aside.traces .trace-item.active { background: #1f2937; border-left: 3px solid #58a6ff; padding-left: 9px; }
-aside.traces .trace-item .tid { font-family: "JetBrains Mono", monospace; font-size: 11px; color: #8b949e; word-break: break-all; }
-aside.traces .trace-item .meta { font-size: 11px; color: #6e7681; margin-top: 4px; }
-aside.traces .trace-item .stats { margin-top: 4px; font-size: 10px; color: #8b949e; }
-aside.traces .trace-item.error { border-left-color: #f85149; }
+aside.traces { border-right: 1px solid var(--border); overflow-y: auto; background: var(--bg); }
+aside.traces .trace-item { padding: 10px 12px; border-bottom: 1px solid var(--border-soft); cursor: pointer; }
+aside.traces .trace-item:hover { background: var(--bg-panel); }
+aside.traces .trace-item.active { background: var(--bg-hover); border-left: 3px solid var(--accent); padding-left: 9px; }
+aside.traces .trace-item .tid { font-family: "JetBrains Mono", monospace; font-size: 11px; color: var(--fg-muted); word-break: break-all; }
+aside.traces .trace-item .meta { font-size: 11px; color: var(--fg-dim); margin-top: 4px; }
+aside.traces .trace-item .stats { margin-top: 4px; font-size: 10px; color: var(--fg-muted); }
+aside.traces .trace-item.error { border-left-color: var(--error); }
 
-section.tree { overflow: auto; padding: 8px 12px; background: #0d1117; }
+section.tree { overflow: auto; padding: 8px 12px; background: var(--bg); }
 section.tree .span-node { padding: 3px 0; user-select: none; }
 section.tree .span-row { display: flex; align-items: center; gap: 6px; padding: 3px 6px; border-radius: 4px; cursor: pointer; min-width: 0; }
-section.tree .span-row:hover { background: #161b22; }
-section.tree .span-row.selected { background: #1f2937; outline: 1px solid #58a6ff; }
-section.tree .toggle { display: inline-block; width: 12px; text-align: center; color: #6e7681; font-size: 10px; }
+section.tree .span-row:hover { background: var(--bg-panel); }
+section.tree .span-row.selected { background: var(--bg-hover); outline: 1px solid var(--accent); }
+section.tree .toggle { display: inline-block; width: 12px; text-align: center; color: var(--fg-dim); font-size: 10px; }
 section.tree .toggle.empty { color: transparent; }
 section.tree .status-icon { width: 14px; text-align: center; font-size: 11px; }
-section.tree .status-ok { color: #3fb950; }
-section.tree .status-error { color: #f85149; }
-section.tree .status-running { color: #d29922; }
+section.tree .status-ok { color: var(--ok); }
+section.tree .status-error { color: var(--error); }
+section.tree .status-running { color: var(--warn); }
 section.tree .span-name { font-family: "JetBrains Mono", monospace; font-size: 12px; white-space: nowrap; }
-section.tree .span-name.prefix-graph { color: #58a6ff; }
-section.tree .span-name.prefix-agent { color: #7ee787; }
-section.tree .span-name.prefix-subagent { color: #d2a8ff; }
-section.tree .span-name.prefix-tool { color: #ffa657; }
-section.tree .span-name.prefix-provider { color: #a5d6ff; }
-section.tree .span-name.prefix-memory { color: #f0883e; }
-section.tree .span-name.prefix-event { color: #e3b341; }
-section.tree .span-duration { font-size: 10px; color: #6e7681; margin-left: auto; white-space: nowrap; }
+section.tree .span-name.prefix-graph { color: var(--span-graph); }
+section.tree .span-name.prefix-agent { color: var(--span-agent); }
+section.tree .span-name.prefix-subagent { color: var(--span-sub); }
+section.tree .span-name.prefix-tool { color: var(--span-tool); }
+section.tree .span-name.prefix-provider { color: var(--span-prov); }
+section.tree .span-name.prefix-memory { color: var(--span-mem); }
+section.tree .span-name.prefix-event { color: var(--span-event); }
+section.tree .span-duration { font-size: 10px; color: var(--fg-dim); margin-left: auto; white-space: nowrap; }
 section.tree .span-tags { display: flex; gap: 4px; }
-section.tree .tag { font-size: 10px; padding: 1px 6px; background: #21262d; border-radius: 8px; color: #8b949e; white-space: nowrap; }
-section.tree .tag.fleet { background: #30363d; color: #d2a8ff; }
-section.tree .tag.role-researcher { background: #1f3a5f; color: #79c0ff; }
-section.tree .tag.role-executor { background: #3b2314; color: #ffa657; }
-section.tree .tag.role-reviewer { background: #2d1b3d; color: #d2a8ff; }
-section.tree .tag.model { background: #0d2818; color: #7ee787; }
-section.tree .tag.tokens { background: #1a1a2e; color: #a5d6ff; }
-section.tree .children { margin-left: 16px; border-left: 1px dashed #30363d; padding-left: 4px; }
+section.tree .tag { font-size: 10px; padding: 1px 6px; background: var(--bg-chip); border-radius: 8px; color: var(--fg-muted); white-space: nowrap; }
+section.tree .tag.fleet { background: var(--bg-chip-2); color: var(--role-v); }
+section.tree .tag.role-researcher { color: var(--role-r); }
+section.tree .tag.role-executor  { color: var(--role-e); }
+section.tree .tag.role-reviewer  { color: var(--role-v); }
+section.tree .tag.model  { color: var(--span-agent); }
+section.tree .tag.tokens { color: var(--span-prov); }
+section.tree .children { margin-left: 16px; border-left: 1px dashed var(--border); padding-left: 4px; }
 section.tree .span-node.hidden { display: none; }
-section.tree .event-row { padding: 2px 6px 2px 22px; font-size: 11px; color: #e3b341; font-family: "JetBrains Mono", monospace; }
-section.tree .event-row::before { content: "◆ "; color: #d29922; }
+section.tree .event-row { padding: 2px 6px 2px 22px; font-size: 11px; color: var(--span-event); font-family: "JetBrains Mono", monospace; }
+section.tree .event-row::before { content: "◆ "; color: var(--warn); }
 
-aside.details { border-left: 1px solid #30363d; overflow-y: auto; padding: 12px 14px; background: #0d1117; }
-aside.details h2 { margin: 0 0 6px 0; font-size: 13px; font-weight: 600; color: #f0f6fc; font-family: "JetBrains Mono", monospace; word-break: break-all; }
-aside.details .subtitle { color: #8b949e; font-size: 11px; margin-bottom: 14px; }
-aside.details .section-title { margin: 16px 0 6px 0; font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; }
+aside.details { border-left: 1px solid var(--border); overflow-y: auto; padding: 12px 14px; background: var(--bg); }
+aside.details h2 { margin: 0 0 6px 0; font-size: 13px; font-weight: 600; color: var(--fg-strong); font-family: "JetBrains Mono", monospace; word-break: break-all; }
+aside.details .subtitle { color: var(--fg-muted); font-size: 11px; margin-bottom: 14px; }
+aside.details .section-title { margin: 16px 0 6px 0; font-size: 11px; color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+aside.details .section-title .expand-hint { font-size: 9px; color: var(--fg-dim); text-transform: none; letter-spacing: 0; font-weight: normal; opacity: 0; transition: opacity 0.15s; }
 aside.details .kv { display: grid; grid-template-columns: 140px 1fr; gap: 2px 8px; font-size: 11px; font-family: "JetBrains Mono", monospace; }
-aside.details .kv .k { color: #8b949e; }
-aside.details .kv .v { color: #c9d1d9; word-break: break-word; }
-aside.details .kv .v.status-ok { color: #3fb950; }
-aside.details .kv .v.status-error { color: #f85149; }
-aside.details .json { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 8px 10px; font-family: "JetBrains Mono", monospace; font-size: 11px; white-space: pre-wrap; word-break: break-word; color: #c9d1d9; max-height: 300px; overflow: auto; }
-aside.details .json .key { color: #79c0ff; }
-aside.details .json .string { color: #a5d6ff; }
-aside.details .json .number { color: #79c0ff; }
-aside.details .json .bool { color: #ff7b72; }
-aside.details .json .null { color: #6e7681; }
-aside.details .json .truncated { color: #d29922; font-style: italic; }
-aside.details .placeholder { color: #6e7681; font-style: italic; text-align: center; margin-top: 40px; }
-aside.details .jump-btn { display: inline-block; padding: 2px 6px; background: #21262d; border: 1px solid #30363d; border-radius: 4px; color: #58a6ff; font-size: 10px; cursor: pointer; text-decoration: none; }
-aside.details .jump-btn:hover { background: #30363d; }
-aside.details .event-item { padding: 6px 8px; background: #161b22; border-left: 2px solid #d29922; margin-bottom: 4px; font-size: 11px; font-family: "JetBrains Mono", monospace; }
-aside.details .event-item .ename { color: #e3b341; }
-aside.details .event-item .etime { color: #6e7681; font-size: 10px; }
+aside.details .kv .k { color: var(--fg-muted); }
+aside.details .kv .v { color: var(--fg); word-break: break-word; }
+aside.details .kv .v.status-ok { color: var(--ok); }
+aside.details .kv .v.status-error { color: var(--error); }
+aside.details .json { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-family: "JetBrains Mono", monospace; font-size: 11px; white-space: pre-wrap; word-break: break-word; color: var(--fg); max-height: 240px; overflow: auto; cursor: zoom-in; position: relative; transition: border-color 0.15s, box-shadow 0.15s; }
+aside.details .json:hover { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+aside.details .json:hover + .section-title .expand-hint,
+aside.details .section-title:hover .expand-hint { opacity: 1; }
+aside.details .json .key { color: var(--link); }
+aside.details .json .string { color: var(--span-prov); }
+aside.details .json .number { color: var(--link); }
+aside.details .json .bool { color: var(--error); }
+aside.details .json .null { color: var(--fg-dim); }
+aside.details .json .truncated { color: var(--warn); font-style: italic; }
+aside.details .placeholder { color: var(--fg-dim); font-style: italic; text-align: center; margin-top: 40px; }
+aside.details .jump-btn { display: inline-block; padding: 2px 6px; background: var(--bg-chip); border: 1px solid var(--border); border-radius: 4px; color: var(--link); font-size: 10px; cursor: pointer; text-decoration: none; }
+aside.details .jump-btn:hover { background: var(--bg-chip-2); }
+aside.details .event-item { padding: 6px 8px; background: var(--bg-panel); border-left: 2px solid var(--warn); margin-bottom: 4px; font-size: 11px; font-family: "JetBrains Mono", monospace; }
+aside.details .event-item .ename { color: var(--span-event); }
+aside.details .event-item .etime { color: var(--fg-dim); font-size: 10px; }
 
-footer.timeline { border-top: 1px solid #30363d; background: #0d1117; padding: 10px 16px 12px; height: 180px; overflow: auto; }
-footer.timeline .tl-title { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+footer.timeline { border-top: 1px solid var(--border); background: var(--bg); padding: 10px 16px 12px; height: 180px; overflow: auto; }
+footer.timeline .tl-title { font-size: 11px; color: var(--fg-muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
 footer.timeline .tl-rows { display: flex; flex-direction: column; gap: 2px; }
 footer.timeline .tl-row { position: relative; height: 16px; display: flex; align-items: center; }
-footer.timeline .tl-bar { position: absolute; height: 14px; border-radius: 2px; cursor: pointer; overflow: hidden; font-size: 10px; color: #0d1117; padding: 0 4px; display: flex; align-items: center; white-space: nowrap; font-family: "JetBrains Mono", monospace; }
-footer.timeline .tl-bar:hover { outline: 1px solid #f0f6fc; }
-footer.timeline .tl-bar.selected { outline: 2px solid #58a6ff; }
-footer.timeline .tl-bar.prefix-graph { background: #58a6ff; }
-footer.timeline .tl-bar.prefix-agent { background: #7ee787; }
-footer.timeline .tl-bar.prefix-subagent { background: #d2a8ff; }
-footer.timeline .tl-bar.prefix-tool { background: #ffa657; }
-footer.timeline .tl-bar.prefix-provider { background: #a5d6ff; }
-footer.timeline .tl-bar.prefix-memory { background: #f0883e; }
-footer.timeline .tl-bar.status-error { background: #f85149; color: #f0f6fc; }
+footer.timeline .tl-bar { position: absolute; height: 14px; border-radius: 2px; cursor: pointer; overflow: hidden; font-size: 10px; color: var(--bg); padding: 0 4px; display: flex; align-items: center; white-space: nowrap; font-family: "JetBrains Mono", monospace; }
+footer.timeline .tl-bar:hover { outline: 1px solid var(--fg-strong); }
+footer.timeline .tl-bar.selected { outline: 2px solid var(--accent); }
+footer.timeline .tl-bar.prefix-graph { background: var(--span-graph); }
+footer.timeline .tl-bar.prefix-agent { background: var(--span-agent); }
+footer.timeline .tl-bar.prefix-subagent { background: var(--span-sub); }
+footer.timeline .tl-bar.prefix-tool { background: var(--span-tool); }
+footer.timeline .tl-bar.prefix-provider { background: var(--span-prov); }
+footer.timeline .tl-bar.prefix-memory { background: var(--span-mem); }
+footer.timeline .tl-bar.status-error { background: var(--error); color: #ffffff; }
 
 .summary-bar { display: flex; gap: 14px; font-size: 11px; flex-wrap: wrap; }
 .summary-bar .metric { display: flex; align-items: center; gap: 4px; }
-.summary-bar .metric .label { color: #8b949e; }
-.summary-bar .metric .val { color: #f0f6fc; font-weight: 600; font-family: "JetBrains Mono", monospace; }
-.summary-bar .metric .val.error { color: #f85149; }
+.summary-bar .metric .label { color: var(--fg-muted); }
+.summary-bar .metric .val { color: var(--fg-strong); font-weight: 600; font-family: "JetBrains Mono", monospace; }
+.summary-bar .metric .val.error { color: var(--error); }
+
+/* ---- Detail dialog ---- */
+#detail-dialog { padding: 0; max-width: min(90vw, 1100px); width: 80vw; max-height: 85vh; background: var(--bg-panel); color: var(--fg); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 20px 60px rgba(0,0,0,0.35); }
+#detail-dialog::backdrop { background: var(--dialog-backdrop); backdrop-filter: blur(2px); }
+#detail-dialog .dialog-head { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--bg-panel); }
+#detail-dialog .dialog-head h3 { margin: 0; font-size: 14px; font-weight: 600; color: var(--fg-strong); flex: 1; font-family: "JetBrains Mono", monospace; }
+#detail-dialog .dialog-head .dialog-subtitle { color: var(--fg-muted); font-size: 11px; }
+#detail-dialog .dialog-head button { background: var(--bg-chip); border: 1px solid var(--border); border-radius: 6px; color: var(--fg); padding: 5px 12px; cursor: pointer; font-size: 12px; }
+#detail-dialog .dialog-head button:hover { border-color: var(--accent); color: var(--fg-strong); }
+#detail-dialog .dialog-body { padding: 14px 16px; font-family: "JetBrains Mono", monospace; font-size: 12px; color: var(--fg); white-space: pre-wrap; word-break: break-word; overflow: auto; max-height: calc(85vh - 60px); margin: 0; background: var(--bg); }
+#detail-dialog .dialog-body .key { color: var(--link); }
+#detail-dialog .dialog-body .string { color: var(--span-prov); }
+#detail-dialog .dialog-body .number { color: var(--link); }
+#detail-dialog .dialog-body .bool { color: var(--error); }
+#detail-dialog .dialog-body .null { color: var(--fg-dim); }
+#detail-dialog .dialog-body .truncated { color: var(--warn); font-style: italic; }
+#copy-toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: var(--bg-panel); color: var(--fg-strong); border: 1px solid var(--border); padding: 8px 16px; border-radius: 6px; font-size: 12px; opacity: 0; transition: opacity 0.2s; pointer-events: none; z-index: 1000; }
+#copy-toast.visible { opacity: 1; }
 </style>
 </head>
 <body>
 <header>
 <h1>MiniClaw Trace Viewer</h1>
 <span class="badge" id="trace-count-badge">-</span>
+<span class="status-pill offline" id="live-status" title="Connection status">static</span>
 <div class="search"><input id="search-input" type="search" placeholder="Search span name, metadata, payload..."></div>
 <span class="filter-chip" id="filter-errors" data-kind="error">errors only</span>
 <span class="filter-chip" id="filter-subagents" data-kind="subagent">subagents only</span>
+<span class="icon-btn" id="theme-toggle" title="Toggle dark/light theme">🌙</span>
 <div class="summary-bar" id="summary-bar"></div>
 </header>
 <main>
@@ -391,8 +505,23 @@ footer.timeline .tl-bar.status-error { background: #f85149; color: #f0f6fc; }
 <div class="tl-title">Timeline (flame graph)</div>
 <div class="tl-rows" id="timeline-container"></div>
 </footer>
+
+<dialog id="detail-dialog">
+  <div class="dialog-head">
+    <h3 id="dialog-title">Details</h3>
+    <span class="dialog-subtitle" id="dialog-subtitle"></span>
+    <button id="dialog-copy" type="button">Copy JSON</button>
+    <button id="dialog-close" type="button">Close ✕</button>
+  </div>
+  <pre class="dialog-body" id="dialog-body"></pre>
+</dialog>
+<div id="copy-toast">Copied to clipboard</div>
+
 <script>
 window.TRACE_DATA = __MINICLAW_TRACE_DATA_PLACEHOLDER__;
+
+const SERVE_MODE = !!(window.TRACE_DATA && window.TRACE_DATA.__SERVE_MODE__);
+if (SERVE_MODE) window.TRACE_DATA = {};
 
 const state = {
   activeTraceId: null,
@@ -402,6 +531,72 @@ const state = {
   filterSubagents: false,
   collapsed: new Set(),
 };
+
+// ---- Theme ----
+const THEME_KEY = "miniclaw-trace-viewer-theme";
+function applyTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  const btn = document.getElementById("theme-toggle");
+  if (btn) btn.textContent = theme === "light" ? "☀️" : "🌙";
+}
+(function initTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem(THEME_KEY); } catch (e) {}
+  if (!saved) {
+    const prefersLight = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
+    saved = prefersLight ? "light" : "dark";
+  }
+  applyTheme(saved);
+})();
+
+// ---- Detail dialog ----
+const dialogEl = document.getElementById("detail-dialog");
+const dialogTitle = document.getElementById("dialog-title");
+const dialogSubtitle = document.getElementById("dialog-subtitle");
+const dialogBody = document.getElementById("dialog-body");
+let dialogCurrentObj = null;
+
+function openDetailDialog(title, subtitle, obj) {
+  dialogCurrentObj = obj;
+  dialogTitle.textContent = title;
+  dialogSubtitle.textContent = subtitle || "";
+  dialogBody.innerHTML = renderJson(obj);
+  if (typeof dialogEl.showModal === "function") {
+    try { dialogEl.showModal(); } catch (e) { dialogEl.setAttribute("open", ""); }
+  } else {
+    dialogEl.setAttribute("open", "");
+  }
+}
+function closeDetailDialog() {
+  if (typeof dialogEl.close === "function") { try { dialogEl.close(); } catch (e) {} }
+  dialogEl.removeAttribute("open");
+}
+document.getElementById("dialog-close").addEventListener("click", closeDetailDialog);
+dialogEl.addEventListener("click", (e) => {
+  // Click on backdrop (dialog element itself, not a descendant) closes.
+  if (e.target === dialogEl) closeDetailDialog();
+});
+document.getElementById("dialog-copy").addEventListener("click", () => {
+  const text = dialogCurrentObj == null ? "" : JSON.stringify(dialogCurrentObj, null, 2);
+  const done = () => {
+    const toast = document.getElementById("copy-toast");
+    toast.classList.add("visible");
+    setTimeout(() => toast.classList.remove("visible"), 1200);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(() => {
+      const ta = document.createElement("textarea");
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); } catch (e) {}
+      document.body.removeChild(ta); done();
+    });
+  } else {
+    const ta = document.createElement("textarea");
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); } catch (e) {}
+    document.body.removeChild(ta); done();
+  }
+});
 
 function el(tag, attrs, children) {
   const e = document.createElement(tag);
@@ -660,12 +855,10 @@ function renderDetails() {
     container.appendChild(kvTrace);
 
     if (Object.keys(trace.metadata || {}).length) {
-      container.appendChild(el("div", { class: "section-title", text: "Trace metadata" }));
-      container.appendChild(el("pre", { class: "json", html: renderJson(trace.metadata) }));
+      appendJsonPanel(container, "Trace metadata", trace.metadata, trace.trace_id);
     }
     if (Object.keys(trace.output || {}).length) {
-      container.appendChild(el("div", { class: "section-title", text: "Trace output" }));
-      container.appendChild(el("pre", { class: "json", html: renderJson(trace.output) }));
+      appendJsonPanel(container, "Trace output", trace.output, trace.trace_id);
     }
     return;
   }
@@ -707,16 +900,13 @@ function renderDetails() {
   }
 
   if (Object.keys(mergedMeta).length) {
-    container.appendChild(el("div", { class: "section-title", text: "Metadata" }));
-    container.appendChild(el("pre", { class: "json", html: renderJson(mergedMeta) }));
+    appendJsonPanel(container, "Metadata", mergedMeta, span.name);
   }
   if (Object.keys(span.payload || {}).length) {
-    container.appendChild(el("div", { class: "section-title", text: "Payload (inputs)" }));
-    container.appendChild(el("pre", { class: "json", html: renderJson(span.payload) }));
+    appendJsonPanel(container, "Payload (inputs)", span.payload, span.name);
   }
   if (Object.keys(span.output || {}).length) {
-    container.appendChild(el("div", { class: "section-title", text: "Output" }));
-    container.appendChild(el("pre", { class: "json", html: renderJson(span.output) }));
+    appendJsonPanel(container, "Output", span.output, span.name);
   }
   if ((span.events || []).length) {
     container.appendChild(el("div", { class: "section-title", text: "Events (" + span.events.length + ")" }));
@@ -729,11 +919,31 @@ function renderDetails() {
         ]),
       ]);
       if (Object.keys(ev.payload || {}).length) {
-        item.appendChild(el("pre", { class: "json", html: renderJson(ev.payload) }));
+        const pre = el("pre", {
+          class: "json",
+          html: renderJson(ev.payload),
+          title: "Click to expand",
+          onclick: () => openDetailDialog("Event payload · " + ev.name, (ev.timestamp || ""), ev.payload),
+        });
+        item.appendChild(pre);
       }
       container.appendChild(item);
     }
   }
+}
+
+function appendJsonPanel(container, title, obj, subtitle) {
+  container.appendChild(el("div", { class: "section-title" }, [
+    title,
+    el("span", { class: "expand-hint", text: "click to expand" }),
+  ]));
+  const pre = el("pre", {
+    class: "json",
+    html: renderJson(obj),
+    title: "Click to open full view",
+    onclick: () => openDetailDialog(title, subtitle || "", obj),
+  });
+  container.appendChild(pre);
 }
 
 function renderTimeline() {
@@ -842,11 +1052,89 @@ document.getElementById("filter-subagents").addEventListener("click", (e) => {
   refresh();
 });
 
-// Init: select first trace
-const firstTid = Object.keys(window.TRACE_DATA)[0];
-if (firstTid) selectTrace(firstTid);
-else {
-  document.getElementById("tree-container").innerHTML = '<div class="placeholder">No traces found in the input file.</div>';
+document.getElementById("theme-toggle").addEventListener("click", () => {
+  const current = document.documentElement.getAttribute("data-theme") || "dark";
+  const next = current === "dark" ? "light" : "dark";
+  applyTheme(next);
+  try { localStorage.setItem(THEME_KEY, next); } catch (e) {}
+});
+
+// Close dialog on Escape even if default handler is disabled.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && dialogEl.hasAttribute("open")) closeDetailDialog();
+});
+
+// ---- Init and (optionally) live refresh via SSE ----
+function setLiveStatus(kind, label) {
+  const pill = document.getElementById("live-status");
+  pill.classList.remove("live", "paused", "offline");
+  pill.classList.add(kind);
+  pill.textContent = label;
+}
+
+function initFromData() {
+  const firstTid = Object.keys(window.TRACE_DATA)[0];
+  if (firstTid) {
+    // Preserve the user's active selection if still present.
+    if (state.activeTraceId && window.TRACE_DATA[state.activeTraceId]) {
+      selectTrace(state.activeTraceId);
+    } else {
+      selectTrace(firstTid);
+    }
+  } else {
+    document.getElementById("tree-container").innerHTML =
+      '<div class="placeholder">No traces yet. Waiting for records...</div>';
+    document.getElementById("traces-list").innerHTML = "";
+    document.getElementById("details-container").innerHTML =
+      '<div class="placeholder">No traces yet.</div>';
+    document.getElementById("timeline-container").innerHTML = "";
+    document.getElementById("summary-bar").innerHTML = "";
+    document.getElementById("trace-count-badge").textContent = "0 traces";
+  }
+}
+
+async function fetchInitial() {
+  try {
+    const r = await fetch("/api/initial", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    window.TRACE_DATA = await r.json();
+  } catch (e) {
+    setLiveStatus("offline", "offline");
+    return false;
+  }
+  initFromData();
+  return true;
+}
+
+let refreshTimer = null;
+function scheduleRefresh() {
+  if (refreshTimer) clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => { fetchInitial(); }, 400);
+}
+
+function openLiveStream() {
+  if (typeof EventSource === "undefined") return;
+  try {
+    const es = new EventSource("/api/stream");
+    es.onopen = () => setLiveStatus("live", "live");
+    es.onmessage = () => scheduleRefresh();
+    es.onerror = () => {
+      // Browser will auto-reconnect; show paused while we wait.
+      setLiveStatus("paused", "reconnecting");
+    };
+  } catch (e) {
+    setLiveStatus("offline", "offline");
+  }
+}
+
+if (SERVE_MODE) {
+  setLiveStatus("paused", "loading");
+  fetchInitial().then((ok) => {
+    if (ok) openLiveStream();
+  });
+} else {
+  setLiveStatus("offline", "static");
+  initFromData();
 }
 </script>
 </body>
@@ -857,6 +1145,260 @@ else {
 def generate_html(traces: dict[str, dict[str, Any]]) -> str:
     data_json = serialize_traces_for_html(traces)
     return HTML_TEMPLATE.replace(_HTML_PLACEHOLDER, data_json)
+
+
+def generate_html_for_server() -> str:
+    """HTML served in serve mode. Data is empty; the browser fetches via API.
+
+    Injects a sentinel ``{"__SERVE_MODE__": true}`` so the client-side JS
+    knows to fetch from `/api/initial` and open an SSE connection instead
+    of reading from the embedded payload.
+    """
+    return HTML_TEMPLATE.replace(_HTML_PLACEHOLDER, '{"__SERVE_MODE__": true}')
+
+
+# ----------------------------------------------------------------------
+# Serve mode: file tailer + HTTP server
+# ----------------------------------------------------------------------
+
+class TraceTailer:
+    """Background thread that tails a JSONL file and fans new lines out to
+    subscribers over thread-safe queues.
+
+    Subscribers receive only lines added AFTER they subscribe; they should
+    fetch the initial snapshot (``get_initial_records``) atomically with
+    subscribing by calling ``snapshot_and_subscribe``.
+    """
+
+    POLL_INTERVAL_S = 0.25
+    SUBSCRIBER_MAX_QUEUE = 10_000
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._records: list[str] = []
+        self._subscribers: list[queue.Queue[str]] = []
+        self._lock = threading.Lock()
+        self._last_pos = 0
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._tail_loop, daemon=True, name="trace-tailer")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+
+    def snapshot_and_subscribe(self) -> tuple[list[str], queue.Queue[str]]:
+        """Return (current records snapshot, new subscriber queue) atomically.
+
+        The queue will start receiving lines appended after this call, with
+        no overlap and no gap relative to the returned snapshot.
+        """
+        q: queue.Queue[str] = queue.Queue(maxsize=self.SUBSCRIBER_MAX_QUEUE)
+        with self._lock:
+            snapshot = list(self._records)
+            self._subscribers.append(q)
+        return snapshot, q
+
+    def unsubscribe(self, q: queue.Queue[str]) -> None:
+        with self._lock:
+            try:
+                self._subscribers.remove(q)
+            except ValueError:
+                pass
+
+    def _tail_loop(self) -> None:
+        while self._running:
+            try:
+                self._read_new_lines()
+            except Exception as exc:  # pragma: no cover - defensive
+                print(f"trace_view: tailer error: {exc}")
+            time.sleep(self.POLL_INTERVAL_S)
+
+    def _read_new_lines(self) -> None:
+        if not self.path.exists():
+            return
+        new_lines: list[str] = []
+        try:
+            with self.path.open("r", encoding="utf-8", errors="replace") as fh:
+                # File may have been rotated / truncated. If current EOF is
+                # smaller than our stored position, reset.
+                fh.seek(0, 2)
+                file_end = fh.tell()
+                if file_end < self._last_pos:
+                    self._last_pos = 0
+                fh.seek(self._last_pos)
+                for raw in fh:
+                    line = raw.rstrip("\n\r")
+                    if line:
+                        new_lines.append(line)
+                self._last_pos = fh.tell()
+        except OSError:
+            return
+        if not new_lines:
+            return
+        with self._lock:
+            self._records.extend(new_lines)
+            subs = list(self._subscribers)
+        for q in subs:
+            for line in new_lines:
+                try:
+                    q.put_nowait(line)
+                except queue.Full:
+                    # Drop the oldest item and retry. A slow subscriber is
+                    # better than a blocked tailer.
+                    try:
+                        q.get_nowait()
+                        q.put_nowait(line)
+                    except (queue.Empty, queue.Full):
+                        pass
+
+
+def _build_traces_from_raw(raw_lines: list[str]) -> dict[str, dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for line in raw_lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return build_traces(records)
+
+
+def _make_request_handler(tailer: TraceTailer, html_body: bytes) -> type[BaseHTTPRequestHandler]:
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:  # quiet
+            return
+
+        def do_GET(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+            path = self.path.split("?", 1)[0]
+            if path == "/" or path == "/index.html":
+                self._send_bytes(html_body, "text/html; charset=utf-8")
+            elif path == "/api/initial":
+                self._send_initial()
+            elif path == "/api/stream":
+                self._send_stream()
+            elif path == "/api/ping":
+                self._send_bytes(b"ok", "text/plain; charset=utf-8")
+            else:
+                self.send_error(404)
+
+        def _send_bytes(self, body: bytes, content_type: str) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def _send_initial(self) -> None:
+            snapshot, q = tailer.snapshot_and_subscribe()
+            # Immediately unsubscribe — /api/initial is one-shot. The
+            # /api/stream endpoint is used for live updates.
+            tailer.unsubscribe(q)
+            traces = _build_traces_from_raw(snapshot)
+            body = serialize_traces_for_html(traces).encode("utf-8")
+            self._send_bytes(body, "application/json; charset=utf-8")
+
+        def _send_stream(self) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            _, q = tailer.snapshot_and_subscribe()
+            try:
+                # Tell the client its connection is live.
+                try:
+                    self.wfile.write(b": connected\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+                while True:
+                    try:
+                        line = q.get(timeout=15)
+                    except queue.Empty:
+                        # Heartbeat to keep proxies and browsers from timing out.
+                        try:
+                            self.wfile.write(b": heartbeat\n\n")
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError):
+                            return
+                        continue
+                    # Escape newlines inside the payload so SSE framing stays valid.
+                    safe = line.replace("\r", "").replace("\n", "\\n")
+                    try:
+                        self.wfile.write(f"data: {safe}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        return
+            finally:
+                tailer.unsubscribe(q)
+
+    return Handler
+
+
+def run_server(
+    path: Path,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 0,
+    open_browser: bool = True,
+) -> int:
+    """Start the live trace server. Blocks until interrupted.
+
+    Returns 0 on clean shutdown, non-zero on startup error.
+    """
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        # Create the file so the tailer has something to poll; a real run
+        # will append to it. Empty file is fine — initial snapshot is [].
+        path.touch()
+
+    tailer = TraceTailer(path)
+    tailer.start()
+
+    html = generate_html_for_server().encode("utf-8")
+    handler_cls = _make_request_handler(tailer, html)
+
+    try:
+        server = ThreadingHTTPServer((host, port), handler_cls)
+    except OSError as exc:
+        print(f"trace_view: could not bind {host}:{port}: {exc}")
+        return 2
+
+    server.daemon_threads = True
+    actual_host, actual_port = server.server_address[0], server.server_address[1]
+    url = f"http://{actual_host}:{actual_port}/"
+    print(f"trace_view: serving {path}")
+    print(f"trace_view: open {url}")
+    print("trace_view: new records will stream live. Ctrl+C to stop.")
+
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\ntrace_view: shutting down.")
+    finally:
+        server.server_close()
+        tailer.stop()
+    return 0
 
 
 # ----------------------------------------------------------------------
@@ -877,15 +1419,37 @@ def main() -> int:
     )
     parser.add_argument(
         "--output", "-o",
-        help="Output HTML path (default: same directory, .html suffix)",
+        help="Output HTML path for static mode (default: alongside input, .html suffix)",
     )
     parser.add_argument(
         "--no-open", action="store_true",
-        help="Do not auto-open the generated HTML in a browser",
+        help="Do not auto-open the browser",
+    )
+    parser.add_argument(
+        "--serve", "-s", action="store_true",
+        help="Start a live server that tails the file and pushes updates via SSE.",
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="Serve mode: bind host (default 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port", type=int, default=0,
+        help="Serve mode: bind port (default: auto-pick)",
     )
     args = parser.parse_args()
 
     input_path = Path(args.path) if args.path else default_trace_path()
+
+    if args.serve:
+        return run_server(
+            input_path,
+            host=args.host,
+            port=args.port,
+            open_browser=not args.no_open,
+        )
+
+    # Static export mode.
     if not input_path.exists():
         print(f"error: trace file not found: {input_path}")
         return 1

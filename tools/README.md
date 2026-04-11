@@ -9,15 +9,17 @@ execute it without any project-level setup.
 
 A single-file visualizer for `~/.miniclaw/traces/miniclaw.jsonl` (the JSONL file
 produced by `miniclaw.observability.local.JsonlTracer`). Parses the trace,
-builds the span tree from `parent_span_id` chains, and emits a self-contained
-interactive HTML page with a collapsible span tree, a flame-graph timeline,
-per-span detail panel, and filter/search.
+builds the span tree from `parent_span_id` chains, and either:
 
-**Zero runtime dependencies** — pure Python stdlib + inline HTML/CSS/JS. The
-resulting HTML file embeds all trace data, so it is shareable as a single file
-(no server needed).
+- **Static mode** — generates a self-contained HTML file with all data
+  embedded. Shareable as one file.
+- **Serve mode** — starts a tiny local HTTP server that tails the trace
+  file and pushes new records to the browser over Server-Sent Events, so
+  the view updates live while a miniclaw run is writing records.
 
-### Usage
+**Zero runtime dependencies** — pure Python stdlib + inline HTML/CSS/JS.
+
+### Usage — static mode (default)
 
 ```bash
 # default: read ~/.miniclaw/traces/miniclaw.jsonl, write .html next to it, auto-open
@@ -33,11 +35,55 @@ python tools/trace_view.py trace.jsonl -o report.html
 python tools/trace_view.py trace.jsonl --no-open
 ```
 
+### Usage — serve mode (live)
+
+```bash
+# Default path + auto port + auto-open browser
+python tools/trace_view.py --serve
+
+# Explicit path
+python tools/trace_view.py path/to/trace.jsonl --serve
+
+# Fixed host/port (for remote / WSL)
+python tools/trace_view.py --serve --host 0.0.0.0 --port 8787
+
+# Serve without auto-opening the browser (handy over SSH)
+python tools/trace_view.py --serve --port 8787 --no-open
+```
+
+While the server is running:
+
+- `GET /` → the HTML UI (loads initial data via API, subscribes to SSE).
+- `GET /api/initial` → full snapshot of every trace currently in the file,
+  as one JSON object keyed by `trace_id`.
+- `GET /api/stream` → Server-Sent Events; each `data:` event is one raw
+  JSONL line that was just appended. The browser debounces multiple events
+  and re-fetches `/api/initial` to avoid mirroring the Python parser in JS.
+- `GET /api/ping` → `ok` health check.
+
+The status pill in the header shows the connection state: `live` (SSE
+connected), `reconnecting` (browser auto-retrying), `static` (file mode).
+
 Equivalently with `uv` (no venv needed):
 
 ```bash
 uv run tools/trace_view.py tools/sample_trace.jsonl
+uv run tools/trace_view.py --serve
 ```
+
+### UI features
+
+- **Dark / light theme** — click the 🌙 / ☀️ button in the header. Preference
+  is saved in `localStorage`; initial theme follows `prefers-color-scheme`.
+- **Click any JSON panel** (Metadata / Payload / Output / Trace metadata /
+  Trace output / Event payload) to pop a modal dialog with the full,
+  untruncated JSON pretty-printed with syntax highlight. The dialog has a
+  **Copy JSON** button that writes the un-highlighted JSON to the clipboard,
+  and you can dismiss with **Esc**, the close button, or by clicking outside.
+- **Search box** filters span tree by substring (name / metadata / payload /
+  output).
+- **Filter chips** — "errors only" hides non-error spans; "subagents only"
+  keeps just the subagent subtree.
 
 ### What it shows
 
