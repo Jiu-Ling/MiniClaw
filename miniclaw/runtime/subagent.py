@@ -4,11 +4,26 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
+from miniclaw.runtime.tool_loop import (
+    trace_messages,
+    trace_tool_calls,
+    trace_tool_names,
+)
+
 if TYPE_CHECKING:
     from miniclaw.config.settings import Settings
     from miniclaw.observability.contracts import TraceContext, Tracer
     from miniclaw.providers.contracts import ChatProvider
     from miniclaw.tools.registry import ToolRegistry
+
+
+def _safe_tracer_call(fn: Callable[..., Any], *args: Any, fallback: Any = None, **kwargs: Any) -> Any:
+    """Invoke a tracer method, swallowing exceptions so a broken tracer never
+    propagates into the subagent loop. Returns `fallback` on failure."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception:
+        return fallback
 
 
 @dataclass(frozen=True)
@@ -139,19 +154,30 @@ async def run_subagent(
     rounds_used = 0
     consecutive_errors = 0
     final_usage: dict[str, Any] = {}
+    max_result_chars = int(getattr(settings, "max_tool_result_chars", 16_000) or 16_000)
 
     try:
         for round_idx in range(settings.max_tool_rounds):
             rounds_used = round_idx + 1
-            round_span = tracer.start_span(
+            round_span = _safe_tracer_call(
+                tracer.start_span,
                 span,
                 name=f"subagent.tool_loop.round_{round_idx}",
                 metadata={"subagent.sub_id": sub_id},
+                inputs={
+                    "messages": trace_messages(messages),
+                    "tools": trace_tool_names(tools_schema),
+                    "model": settings.model,
+                },
+                fallback=span,
             )
-            chat_span = tracer.start_span(
+            chat_span = _safe_tracer_call(
+                tracer.start_span,
                 round_span,
                 name="provider.achat",
                 metadata={"subagent.sub_id": sub_id, "provider.model": settings.model},
+                inputs={"messages": trace_messages(messages), "tool_count": len(tools_schema or [])},
+                fallback=round_span,
             )
             try:
                 response = await provider.achat(
@@ -160,8 +186,14 @@ async def run_subagent(
                     tools=tools_schema or None,
                 )
             except Exception as exc:
-                tracer.finish_span(chat_span, status="error", metadata={"error": str(exc)})
-                tracer.finish_span(round_span, status="error")
+                _safe_tracer_call(
+                    tracer.finish_span, chat_span,
+                    status="error", metadata={"error": str(exc)}, fallback=None,
+                )
+                _safe_tracer_call(
+                    tracer.finish_span, round_span,
+                    status="error", fallback=None,
+                )
                 raise
 
             usage_raw = getattr(response, "usage", None)
@@ -171,13 +203,30 @@ async def run_subagent(
                 elif isinstance(usage_raw, dict):
                     final_usage = dict(usage_raw)
 
-            tracer.finish_span(chat_span, status="ok", metadata={"provider.usage": final_usage})
             last_response_text = str(response.content or "")
+            round_outputs = {
+                "content": last_response_text[:max_result_chars],
+                "tool_calls": trace_tool_calls(response.tool_calls),
+                "usage": dict(final_usage),
+            }
+            _safe_tracer_call(
+                tracer.finish_span, chat_span,
+                status="ok",
+                metadata={"provider.usage": final_usage},
+                outputs=round_outputs,
+                fallback=None,
+            )
 
             if not response.tool_calls:
-                tracer.finish_span(round_span, status="ok")
+                _safe_tracer_call(
+                    tracer.finish_span, round_span,
+                    status="ok", outputs=round_outputs, fallback=None,
+                )
                 _emit_completed(on_event, sub_id, "completed", last_response_text, rounds_used)
-                tracer.finish_span(span, status="ok", metadata={"rounds_used": rounds_used})
+                _safe_tracer_call(
+                    tracer.finish_span, span,
+                    status="ok", metadata={"rounds_used": rounds_used}, fallback=None,
+                )
                 return SubagentResult(
                     sub_id=sub_id,
                     fleet_id=fleet_id,
@@ -193,13 +242,16 @@ async def run_subagent(
             messages.append(_assistant_with_tool_calls(response))
 
             # Execute tool calls (worker_visible_only=True filters blacklisted tools).
+            # Pass tracer so each tool.<name> span hangs under the round span.
             tool_msgs, _ = execute_tool_calls(
                 response.tool_calls,
                 tool_registry,
                 ActiveCapabilities(),
-                max_result_chars=settings.max_tool_result_chars,
+                max_result_chars=max_result_chars,
                 runtime_context=dict(runtime_metadata),
                 worker_visible_only=True,
+                tracer=tracer,
+                parent_trace=round_span,
             )
 
             # Convert RuntimeMessage dicts back to ChatMessage for the next round.
@@ -211,7 +263,13 @@ async def run_subagent(
                     content=msg_dict.get("content", ""),
                 ))
 
-            tracer.finish_span(round_span, status="ok", metadata={"tool_calls": len(response.tool_calls)})
+            _safe_tracer_call(
+                tracer.finish_span, round_span,
+                status="ok",
+                metadata={"tool_calls": len(response.tool_calls)},
+                outputs=round_outputs,
+                fallback=None,
+            )
 
             # Track consecutive tool errors.
             if tool_msgs and _last_is_error(tool_msgs):

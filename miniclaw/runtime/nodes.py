@@ -19,6 +19,9 @@ from miniclaw.runtime.tool_loop import (
     format_error,
     parse_tool_arguments,
     runtime_message_from_chat,
+    trace_messages as _trace_messages,
+    trace_tool_calls as _trace_tool_calls,
+    trace_tool_names as _trace_tool_names,
 )
 from miniclaw.tools.registry import ToolRegistry
 
@@ -335,15 +338,27 @@ def make_agent(
         if on_event is not None:
             on_event({"kind": kind, **kwargs})
 
-    def _safe_start_span(parent: Any, *, name: str, metadata: dict[str, Any] | None = None) -> Any:
+    def _safe_start_span(
+        parent: Any,
+        *,
+        name: str,
+        metadata: dict[str, Any] | None = None,
+        inputs: dict[str, Any] | None = None,
+    ) -> Any:
         try:
-            return resolved_tracer.start_span(parent, name=name, metadata=metadata)
+            return resolved_tracer.start_span(parent, name=name, metadata=metadata, inputs=inputs)
         except Exception:
             return parent  # fall back to parent context so finish calls have something
 
-    def _safe_finish_span(ctx: Any, *, status: str, metadata: dict[str, Any] | None = None) -> None:
+    def _safe_finish_span(
+        ctx: Any,
+        *,
+        status: str,
+        metadata: dict[str, Any] | None = None,
+        outputs: dict[str, Any] | None = None,
+    ) -> None:
         try:
-            resolved_tracer.finish_span(ctx, status=status, metadata=metadata)
+            resolved_tracer.finish_span(ctx, status=status, metadata=metadata, outputs=outputs)
         except Exception:
             pass
 
@@ -363,17 +378,39 @@ def make_agent(
         consecutive_errors = 0
         try:
             for round_idx in range(max_rounds):
-                round_span = _safe_start_span(parent_trace, name=f"agent.tool_loop.round_{round_idx}")
+                # Build messages/tools BEFORE opening the round span so we can
+                # record them as span inputs. Failures here still get traced as
+                # an error on a minimal span so there's no silent loss.
+                try:
+                    messages = context_builder.build_provider_messages(loop_state)
+                    visible_tools = _build_provider_tools(tool_registry, loop_state["active_capabilities"])
+                except Exception:
+                    _safe_start_span(parent_trace, name=f"agent.tool_loop.round_{round_idx}")
+                    # finish immediately — parent chain stays balanced
+                    raise
+
+                round_span = _safe_start_span(
+                    parent_trace,
+                    name=f"agent.tool_loop.round_{round_idx}",
+                    inputs={
+                        "messages": _trace_messages(messages),
+                        "tools": _trace_tool_names(visible_tools),
+                        "model": settings.model,
+                    },
+                )
                 round_status = "ok"
+                round_outputs: dict[str, Any] = {}
                 try:
                     chat_span = _safe_start_span(
                         round_span,
                         name="provider.achat",
                         metadata={"provider.model": settings.model},
+                        inputs={
+                            "messages": _trace_messages(messages),
+                            "tool_count": len(visible_tools or []),
+                        },
                     )
                     try:
-                        messages = context_builder.build_provider_messages(loop_state)
-                        visible_tools = _build_provider_tools(tool_registry, loop_state["active_capabilities"])
                         response = _run_provider_sync(
                             _invoke_provider(
                                 provider,
@@ -386,9 +423,21 @@ def make_agent(
                         _safe_finish_span(chat_span, status="error")
                         round_status = "error"
                         raise
-                    _safe_finish_span(chat_span, status="ok", metadata={
-                        "provider.usage": dict(getattr(response, "usage", {}) or {}),
-                    })
+                    _safe_finish_span(
+                        chat_span,
+                        status="ok",
+                        metadata={"provider.usage": dict(getattr(response, "usage", {}) or {})},
+                        outputs={
+                            "content": (response.content or "")[:max_result_chars],
+                            "tool_calls": _trace_tool_calls(response.tool_calls),
+                            "usage": dict(getattr(response, "usage", {}) or {}),
+                        },
+                    )
+                    round_outputs = {
+                        "content": (response.content or "")[:max_result_chars],
+                        "tool_calls": _trace_tool_calls(response.tool_calls),
+                        "usage": dict(getattr(response, "usage", {}) or {}),
+                    }
 
                     usage = _merge_usage(usage, response)
                     if not response.tool_calls:
@@ -427,7 +476,14 @@ def make_agent(
                                 tool_args = {"raw": tool_args}
                         _emit("tool_calling", text=tool_name, tool_name=tool_name, arguments=tool_args)
 
-                    loop_state = apply_tool_calls(loop_state, response, tool_registry, max_result_chars=max_result_chars)
+                    loop_state = apply_tool_calls(
+                        loop_state,
+                        response,
+                        tool_registry,
+                        max_result_chars=max_result_chars,
+                        tracer=resolved_tracer,
+                        parent_trace=round_span,
+                    )
 
                     last_tool_messages = [
                         msg for msg in loop_state.get("messages", [])
@@ -464,7 +520,7 @@ def make_agent(
                     round_status = "error"
                     raise
                 finally:
-                    _safe_finish_span(round_span, status=round_status)
+                    _safe_finish_span(round_span, status=round_status, outputs=round_outputs)
         except Exception as exc:
             return _error_state(loop_state, format_error(exc), usage)
 
@@ -591,6 +647,8 @@ def _build_provider_tools(
 def _is_error_content(message: RuntimeMessage | dict[str, Any]) -> bool:
     content = message.get("content", "") if isinstance(message, dict) else message.content
     return str(content or "").startswith("ERROR: ")
+
+
 
 
 def _finish_response(
