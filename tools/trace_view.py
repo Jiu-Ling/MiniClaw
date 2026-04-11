@@ -1183,8 +1183,20 @@ class TraceTailer:
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
+        """Catch up the existing file contents synchronously, then start the
+        background tail thread.
+
+        The synchronous initial read closes a race where a client's
+        ``/api/initial`` request arrives before the background thread's
+        first poll (250ms later) and ends up seeing an empty snapshot
+        even though the file is full of existing records.
+        """
         if self._running:
             return
+        try:
+            self._read_new_lines()
+        except Exception as exc:  # pragma: no cover - defensive
+            print(f"trace_view: initial catch-up error: {exc}")
         self._running = True
         self._thread = threading.Thread(target=self._tail_loop, daemon=True, name="trace-tailer")
         self._thread.start()
