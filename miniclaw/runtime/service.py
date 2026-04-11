@@ -74,8 +74,8 @@ class RuntimeService:
         thread_control_store: object | None = None,
         memory_indexer: MemoryIndexer | None = None,
         retriever: HybridRetriever | None = None,
-        mini_provider: object | None = None,
-        tracer: object | None = None,
+        mini_provider: OpenAICompatibleProvider | None = None,
+        tracer: TraceContext | None = None,
         clock: object | None = None,
     ) -> None:
         self.settings = settings
@@ -215,6 +215,7 @@ class RuntimeService:
                         runtime_metadata=runtime_metadata,
                         user_content_parts=user_content_parts,
                         snapshot_values=snapshot_values,
+                        turn_trace=run_context,
                     ),
                     config,
                 )
@@ -336,6 +337,7 @@ class RuntimeService:
             runtime_metadata=runtime_metadata,
             user_content_parts=user_content_parts,
             snapshot_values=snapshot_values,
+            turn_trace=run_context,
         )
 
         result_holder: list[dict[str, Any] | None] = [None]
@@ -494,6 +496,7 @@ class RuntimeService:
         runtime_metadata: Mapping[str, object] | None,
         user_content_parts: list[dict[str, object]] | None,
         snapshot_values: Mapping[str, object],
+        turn_trace: TraceContext | None = None,
     ) -> dict[str, object]:
         resolved_runtime_metadata = {"thread_id": thread_id}
         if runtime_metadata is not None:
@@ -501,6 +504,13 @@ class RuntimeService:
                 {str(key): value for key, value in runtime_metadata.items() if value is not None}
             )
         resolved_runtime_metadata.setdefault("clock", self.clock().isoformat())
+        # Stash the turn-level trace_id / run_id so downstream nodes and
+        # agent/subagent span builders share one trace. Underscore keys are
+        # stripped from tool span payloads by `_safe_copy_for_trace` so they
+        # never leak into persisted trace records.
+        if turn_trace is not None:
+            resolved_runtime_metadata["_turn_trace_id"] = turn_trace.trace_id
+            resolved_runtime_metadata["_turn_run_id"] = turn_trace.run_id
         return {
             "thread_id": thread_id,
             "runtime_metadata": resolved_runtime_metadata,

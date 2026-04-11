@@ -18,6 +18,7 @@ from miniclaw.runtime.tool_loop import (
     coerce_active_capabilities,
     format_error,
     parse_tool_arguments,
+    resolve_turn_trace as _resolve_turn_trace,
     runtime_message_from_chat,
     trace_messages as _trace_messages,
     trace_tool_calls as _trace_tool_calls,
@@ -367,13 +368,13 @@ def make_agent(
         loop_state["active_capabilities"] = coerce_active_capabilities(state.get("active_capabilities"))
         usage: RuntimeUsage = {}
 
-        # Build a parent trace context for this agent invocation
-        rt_meta_init = dict(loop_state.get("runtime_metadata", {}) or {})
-        parent_trace = build_run_context(
-            name="graph.agent",
-            thread_id=str(rt_meta_init.get("thread_id", "")) or None,
-            channel=str(rt_meta_init.get("channel", "")) or None,
-        )
+        # Reuse the turn-level trace context (set by the service layer via
+        # runtime_metadata._turn_trace_id / _turn_run_id) so every span in
+        # this agent invocation — round spans, provider.achat, tool.<name>,
+        # subagent.run — shares the same trace_id as the outer graph nodes.
+        # Fall back to a fresh run context only when invoked outside the
+        # normal service path (e.g. isolated tests).
+        parent_trace = _resolve_turn_trace(loop_state, "graph.agent")
 
         consecutive_errors = 0
         try:

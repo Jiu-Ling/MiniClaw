@@ -5,7 +5,8 @@ from typing import TYPE_CHECKING, Any
 
 from langgraph.graph import END, START, StateGraph
 
-from miniclaw.observability.contracts import NoopTracer, build_run_context
+from miniclaw.observability.contracts import NoopTracer
+from miniclaw.runtime.tool_loop import resolve_turn_trace
 from miniclaw.runtime.nodes import (
     clarify,
     complete,
@@ -88,30 +89,16 @@ def _wrap_node_with_state_snapshot(
     with an input state snapshot and closes with an output snapshot (of the
     delta returned by the node). Failures propagate but always close the span.
 
-    Each wrapped invocation creates its own top-level run context. Graph
-    nodes don't share a parent across nodes — LangGraph doesn't give us a
-    per-turn context hook — so `graph.classify`, `graph.agent`, etc. end up
-    as sibling top-level spans in separate run contexts. This is acceptable
-    since the real dispatch tree (agent.tool_loop, subagent.run, tool.*) is
-    rooted inside `make_agent` which builds its own run context with proper
-    child span wiring.
+    All wrapped invocations within the same turn share one ``trace_id`` by
+    reading ``_turn_trace_id`` / ``_turn_run_id`` from ``runtime_metadata``
+    (seeded by the service layer). This is what lets the trace viewer group
+    every node + agent round + tool span of a turn under one logical trace.
     """
     span_name = f"graph.{name}"
 
     def wrapped(state: RuntimeState) -> RuntimeState | Mapping[str, Any]:
-        runtime_metadata = state.get("runtime_metadata") if isinstance(state, Mapping) else None
-        thread_id = None
-        channel = None
-        if isinstance(runtime_metadata, Mapping):
-            thread_id = runtime_metadata.get("thread_id") or None
-            channel = runtime_metadata.get("channel") or None
-
+        parent = resolve_turn_trace(state, "graph.run")
         try:
-            parent = build_run_context(
-                name="graph.run",
-                thread_id=str(thread_id) if thread_id else None,
-                channel=str(channel) if channel else None,
-            )
             span = tracer.start_span(
                 parent,
                 name=span_name,

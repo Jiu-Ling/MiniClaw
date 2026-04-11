@@ -9,7 +9,9 @@ from miniclaw.tools.contracts import ToolCall, ToolResult
 from miniclaw.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
-    from miniclaw.observability.contracts import TraceContext, Tracer
+    from miniclaw.observability.contracts import Tracer
+
+from miniclaw.observability.contracts import TraceContext, build_run_context
 
 MAX_TOOL_RESULT_CHARS = 16_000
 _ACTIVATION_TOOLS = frozenset({"load_skill_tools", "load_mcp_tools"})
@@ -56,6 +58,62 @@ def trace_tool_names(tools: list[dict[str, Any]] | None) -> list[str]:
         if isinstance(fn, dict) and fn.get("name"):
             names.append(str(fn["name"]))
     return names
+
+
+def resolve_turn_trace(state: Any, fallback_name: str) -> TraceContext:
+    """Reconstruct a parent TraceContext from ``state["runtime_metadata"]``.
+
+    The service layer writes ``_turn_trace_id`` + ``_turn_run_id`` into
+    runtime_metadata at turn start so every span in the turn (graph nodes,
+    agent tool-loop rounds, provider.achat, per-tool spans, subagents)
+    shares one ``trace_id``. Without those keys we fall back to a fresh
+    run context so isolated calls (tests, direct invocations) still work.
+    """
+    thread_id: str | None = None
+    channel: str | None = None
+    turn_trace_id: str | None = None
+    turn_run_id: str | None = None
+    runtime_metadata: Any = None
+    if isinstance(state, dict) or (state is not None and hasattr(state, "get")):
+        try:
+            runtime_metadata = state.get("runtime_metadata")
+        except Exception:
+            runtime_metadata = None
+    if isinstance(runtime_metadata, dict) or (runtime_metadata is not None and hasattr(runtime_metadata, "get")):
+        try:
+            raw_thread = runtime_metadata.get("thread_id")
+            if raw_thread:
+                thread_id = str(raw_thread)
+        except Exception:
+            pass
+        try:
+            raw_channel = runtime_metadata.get("channel")
+            if raw_channel:
+                channel = str(raw_channel)
+        except Exception:
+            pass
+        try:
+            raw_trace = runtime_metadata.get("_turn_trace_id")
+            if raw_trace:
+                turn_trace_id = str(raw_trace)
+        except Exception:
+            pass
+        try:
+            raw_run = runtime_metadata.get("_turn_run_id")
+            if raw_run:
+                turn_run_id = str(raw_run)
+        except Exception:
+            pass
+
+    if turn_trace_id and turn_run_id:
+        return TraceContext(
+            trace_id=turn_trace_id,
+            run_id=turn_run_id,
+            thread_id=thread_id,
+            channel=channel,
+            name="graph.run",
+        )
+    return build_run_context(name=fallback_name, thread_id=thread_id, channel=channel)
 
 
 def trace_tool_calls(tool_calls: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
