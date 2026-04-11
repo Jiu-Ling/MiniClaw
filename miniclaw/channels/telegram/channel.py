@@ -21,7 +21,11 @@ from miniclaw.channels.contracts import (
 class TelegramChannel:
     class Meta:
         name = "telegram"
-        stream_capability = StreamCapability.NATIVE
+        # Telegram Bot API has no native streaming ("draft") endpoint.
+        # We simulate streaming with send_message + edit_message_text via
+        # the EDIT pathway in MessageLoop (_stream_via_edit). Rate-limited
+        # to ~1 edit/sec by the loop's 0.8s throttle.
+        stream_capability = StreamCapability.EDIT
         id_prefix = "tg"
         max_message_length = 4096
         supports_edit = True
@@ -36,7 +40,6 @@ class TelegramChannel:
         self._poll_timeout = poll_timeout
         self._bot: telegram.Bot | None = None
         self._offset: int | None = None
-        self._draft_counter = 0
 
     async def start(self) -> None:
         self._bot = telegram.Bot(token=self._bot_token)
@@ -130,57 +133,21 @@ class TelegramChannel:
         except Exception:
             pass
 
+    # Streaming methods are not used: stream_capability = EDIT, so MessageLoop
+    # drives progressive updates via send_message + edit_message directly.
+    # These stubs exist only to satisfy the Channel protocol contract.
     async def start_stream(self, channel_id: str, *, thread_id: str = "", reply_to: str = "") -> StreamHandle:
-        self._draft_counter += 1
-        draft_id = self._draft_counter
-        chat_id = self._to_chat_id(channel_id)
-        msg_thread_id = self._extract_message_thread_id(channel_id)
-
-        kwargs: dict = {"chat_id": chat_id, "draft_id": draft_id, "text": "..."}
-        if msg_thread_id:
-            kwargs["message_thread_id"] = msg_thread_id
-        if reply_to and reply_to.isdigit():
-            kwargs["reply_to_message_id"] = int(reply_to)
-
-        try:
-            await self._bot.send_message_draft(**kwargs)
-        except Exception:
-            pass
-
-        return StreamHandle(
-            channel_id=channel_id, handle_id=str(draft_id),
-            metadata={"chat_id": chat_id, "draft_id": draft_id},
-        )
+        sent = await self.send_message(OutboundMessage(
+            channel_id=channel_id, text="⏳", reply_to=reply_to,
+        ))
+        return StreamHandle(channel_id=channel_id, handle_id=sent.message_id)
 
     async def append_stream(self, handle: StreamHandle, text: str) -> None:
-        chat_id = handle.metadata.get("chat_id")
-        draft_id = handle.metadata.get("draft_id")
-        if not chat_id or not draft_id:
-            return
-        try:
-            await self._bot.send_message_draft(
-                chat_id=chat_id, draft_id=draft_id, text=text, parse_mode="HTML",
-            )
-        except Exception:
-            try:
-                await self._bot.send_message_draft(
-                    chat_id=chat_id, draft_id=draft_id, text=text,
-                )
-            except Exception:
-                pass
+        await self.edit_message(handle.channel_id, handle.handle_id, text)
 
     async def stop_stream(self, handle: StreamHandle, final_text: str) -> SentMessage:
-        sent = await self.send_message(OutboundMessage(
-            channel_id=handle.channel_id, text=final_text, parse_mode="HTML",
-        ))
-        chat_id = handle.metadata.get("chat_id")
-        draft_id = handle.metadata.get("draft_id")
-        if chat_id and draft_id:
-            try:
-                await self._bot.delete_message_draft(chat_id=chat_id, draft_id=draft_id)
-            except Exception:
-                pass
-        return sent
+        await self.edit_message(handle.channel_id, handle.handle_id, final_text)
+        return SentMessage(message_id=handle.handle_id, channel_id=handle.channel_id)
 
     async def send_file(self, channel_id: str, file_path: str, *, caption: str = "") -> SentMessage:
         chat_id = self._to_chat_id(channel_id)

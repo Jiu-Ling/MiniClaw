@@ -29,7 +29,7 @@ from miniclaw.tools.builtin.activation import (
     build_reload_mcp_servers_tool,
 )
 from miniclaw.tools.builtin.cron import build_cron_tool
-from miniclaw.tools.builtin.filesystem import build_read_file_tool
+from miniclaw.tools.builtin.filesystem import build_read_file_tool, build_write_file_tool
 from miniclaw.tools.builtin.memory_search import build_search_memory_tool
 from miniclaw.tools.builtin.send import build_send_tool
 from miniclaw.tools.builtin.skills import build_list_skills_tool, build_load_skill_tool
@@ -41,6 +41,7 @@ from miniclaw.tools.messaging import MessagingBridge
 from miniclaw.tools.search import SearchBackend, build_search_backend
 from miniclaw.tools.registry import RegisteredTool
 from miniclaw.tools.registry import ToolRegistry
+from miniclaw.observability.contracts import TraceContext
 
 
 
@@ -78,9 +79,9 @@ def build_tool_registry(
     search_backend: SearchBackend | None = None,
     messaging_bridge: MessagingBridge | None = None,
     settings: Settings | None = None,
-    provider: object | None = None,
-    tracer: object | None = None,
-    retriever: object | None = None,
+    provider: OpenAICompatibleProvider | None = None,
+    tracer: TraceContext | None = None,
+    retriever: HybridRetriever | None = None,
     heartbeat_file: Path | None = None,
 ) -> ToolRegistry:
     resolved_settings = settings
@@ -102,6 +103,7 @@ def build_tool_registry(
     resolved_max_read_file_bytes = resolved_settings.max_read_file_bytes if resolved_settings else 32 * 1024
     builtin_tools = [
         build_read_file_tool(workspace=resolved_workspace, max_bytes=resolved_max_read_file_bytes),
+        build_write_file_tool(),
         build_cron_tool(cron_service=resolved_cron_service),
         build_list_skills_tool(resolved_loader),
         build_load_skill_tool(resolved_loader),
@@ -124,7 +126,7 @@ def build_tool_registry(
             )
         )
     _CORE_TOOLS = {
-        "shell", "read_file", "send", "web_search",
+        "shell", "read_file", "write_file", "send", "web_search",
         "cron", "manage_heartbeat",
         "load_skill_tools", "load_mcp_tools",
         "spawn_subagent",

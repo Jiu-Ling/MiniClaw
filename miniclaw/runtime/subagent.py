@@ -48,11 +48,13 @@ ROLE_DEFAULTS: dict[str, dict[str, Any]] = {
     "executor": {
         "prompt": (
             "You are an executor subagent. Your job is to carry out the assigned task and "
-            "report concrete results. You may modify files and run shell commands. "
-            "When the task is complete, respond with a final summary (no tool calls)."
+            "report concrete results. Use write_file to create or modify files in your "
+            "user sandbox (path is relative to the sandbox root). Use the read-only shell "
+            "to inspect files. When the task is complete, respond with a final summary "
+            "(no tool calls)."
         ),
         "tools": (
-            "read_file", "shell", "memory_search",
+            "read_file", "write_file", "shell", "memory_search",
             "load_skill_tools", "load_mcp_tools",
         ),
     },

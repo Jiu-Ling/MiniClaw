@@ -84,12 +84,34 @@ class ContextBuilder:
     def _build_dynamic_sections(self, state: Mapping[str, Any] | None = None) -> list[str]:
         """Return prompt sections that change per turn (not cache-eligible)."""
         sections: list[str] = []
+        sandbox_section = self._build_sandbox_section(state)
+        if sandbox_section:
+            sections.append(sandbox_section)
         memory_context = self._resolve_memory_context(state)
         memory_section = render_memory_section(memory_context)
         if memory_section:
             sections.append(memory_section)
         sections.extend(self._build_planner_sections(state))
         return [s for s in sections if s]
+
+    def _build_sandbox_section(self, state: Mapping[str, Any] | None = None) -> str:
+        """Render the per-user workspace sandbox rule. Empty if no sandbox is set."""
+        runtime_metadata = self._resolve_runtime_metadata(state) if isinstance(state, Mapping) else {}
+        user_sandbox = str(runtime_metadata.get("user_sandbox", "") or "").strip()
+        if not user_sandbox:
+            return ""
+        user_id = str(runtime_metadata.get("user_id", "") or "").strip()
+        workspace = str(self.workspace.expanduser().resolve())
+        user_line = f" (user: {user_id})" if user_id else ""
+        return "\n".join([
+            "## Workspace Sandbox",
+            f"- Your write area{user_line}: `{user_sandbox}`",
+            "- ALL file writes MUST go through the `write_file` tool with a path RELATIVE to your sandbox.",
+            "- `write_file` rejects absolute paths and any path that escapes your sandbox.",
+            f"- Read access: anywhere under `{workspace}` via `read_file` or the read-only `shell`.",
+            "- `shell` is READ-ONLY: no `>`, `|`, `;`, no `cp`/`mv`/`touch`/`mkdir`/`rm`, no `git` state changes, no package managers.",
+            "- Any write outside the sandbox will be rejected. Do not fight it — use `write_file`.",
+        ])
 
     def build_system_prompt(self, state: Mapping[str, Any] | None = None) -> str:
         # Static parts first (stable prefix for cache), then dynamic parts

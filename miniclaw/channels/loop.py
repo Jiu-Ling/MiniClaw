@@ -14,6 +14,7 @@ from miniclaw.channels.contracts import (
 )
 from miniclaw.channels.markdown import markdown_to_html
 from miniclaw.commands.registry import CommandContext, CommandRegistry
+from miniclaw.runtime import RuntimeService
 
 
 _TEXT_FILE_EXTENSIONS = {".txt", ".md", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml", ".csv", ".log", ".sh", ".html", ".css", ".xml", ".sql", ".ini", ".cfg", ".conf", ".env", ".rst"}
@@ -28,7 +29,7 @@ class MessageLoop:
     def __init__(
         self,
         channel: Any,
-        runtime: Any,
+        runtime: RuntimeService,
         command_registry: CommandRegistry,
         access_store: ChannelAccessStore,
         messaging_bridge: Any | None = None,
@@ -67,7 +68,7 @@ class MessageLoop:
             ctx = CommandContext(
                 thread_id=inbound.thread_id,
                 channel=self.channel.Meta.name,
-                settings=getattr(self.runtime, "settings", None),
+                settings=self.runtime.settings,
                 runtime_service=self.runtime,
                 args=self.command_registry.extract_args(inbound.text),
                 registry=self.command_registry,
@@ -95,16 +96,60 @@ class MessageLoop:
             and not inbound.attachments
         )
 
+        user_id, user_sandbox = self._resolve_user_sandbox(inbound, meta.name)
         runtime_metadata = {
             "thread_id": inbound.thread_id,
             "channel": meta.name,
             "chat_id": inbound.channel_id,
+            "sender_id": inbound.sender_id,
+            "user_id": user_id,
+            "user_sandbox": user_sandbox,
         }
 
         if use_stream:
             await self._run_streaming(inbound, user_input, content_parts, runtime_metadata)
         else:
             await self._run_blocking(inbound, user_input, content_parts, runtime_metadata)
+
+    def _resolve_user_sandbox(self, inbound: InboundMessage, channel_name: str) -> tuple[str, str]:
+        """Derive a stable user_id and ensure the user's sandbox directory exists.
+
+        - Telegram: tg-<sender_id>
+        - CLI: cli-default (no real sender in a terminal)
+        - Test:  test-default
+        - Fallback: <channel>-anon
+        """
+        sender = (inbound.sender_id or "").strip()
+        if channel_name == "telegram" and sender:
+            user_id = f"tg-{sender}"
+        elif channel_name in {"cli", "test"}:
+            user_id = f"{channel_name}-default"
+        elif sender:
+            user_id = f"{channel_name}-{sender}"
+        else:
+            user_id = f"{channel_name}-anon"
+
+        workspace = self._resolve_workspace_root()
+        sandbox = workspace / ".miniclaw" / "users" / user_id
+        try:
+            sandbox.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        return user_id, str(sandbox)
+
+    def _resolve_workspace_root(self) -> Path:
+        """Best-effort workspace root lookup. Uses runtime.settings.runtime_dir
+        if available; otherwise walks up from cwd looking for pyproject.toml."""
+        settings = getattr(self.runtime, "settings", None)
+        if settings is not None:
+            runtime_dir = getattr(settings, "runtime_dir", None)
+            if runtime_dir is not None:
+                return Path(runtime_dir)
+        cwd = Path.cwd()
+        for candidate in [cwd, *cwd.parents]:
+            if (candidate / "pyproject.toml").exists():
+                return candidate
+        return cwd
 
     async def _run_blocking(self, inbound, user_input, content_parts, runtime_metadata):
         await self._safe_typing(inbound.channel_id)
