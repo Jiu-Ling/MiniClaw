@@ -31,3 +31,7 @@ Thumbs.db
 
 # Local docs (specs, plans, architecture notes)
 docs/
+
+# Local tests (kept untracked per user preference)
+tests/
+!tests/.gitkeep
