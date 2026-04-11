@@ -35,3 +35,6 @@ docs/
 # Local tests (kept untracked per user preference)
 tests/
 !tests/.gitkeep
+
+# Generated trace visualizer output
+tools/*.html
