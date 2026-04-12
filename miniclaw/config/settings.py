@@ -85,13 +85,14 @@ class Settings(BaseSettings):
     max_tool_rounds: int = 16
     max_consecutive_tool_errors: int = 4
     max_tool_result_chars: int = 16_000
+    subagent_max_tool_result_chars: int = 2_000
     max_read_file_bytes: int = 32 * 1024
-    history_char_budget: int = 30_000
+    history_char_budget: int = 12_000
 
     # Context compression
-    compress_keep_recent_turns: int = 4
+    compress_keep_recent_turns: int = 2
     compress_turn_summary_chars: int = 200
-    max_history_messages: int = 20
+    max_history_messages: int = 4
 
     # Embedding
     embedding_model: str = "bge-m3"
@@ -99,7 +100,7 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
 
     # Memory retrieval
-    memory_search_top_k: int = 10
+    memory_search_top_k: int = 5
     memory_token_budget: int = 2000
 
     # Heartbeat

@@ -132,8 +132,8 @@ def _generate_plan(
     state: RuntimeState,
     tool_registry: ToolRegistry | None,
 ) -> dict[str, Any]:
-    user_input = str(state.get("user_input", "")).strip()
-    memory_context = str(state.get("memory_context", "")).strip()
+    user_input = str(state.get("user_input", "")).strip()[:500]
+    memory_context = str(state.get("memory_context", "")).strip()[:2000]
     user_message = f"Request: {user_input}"
     if memory_context:
         user_message += f"\n\nMemory context:\n{memory_context}"
@@ -188,7 +188,7 @@ def make_classify(
 
 
 def _call_classify(provider: ChatProvider, user_input: str, last_turn: str) -> dict[str, str] | None:
-    user_msg = f"用户消息: {user_input}"
+    user_msg = f"用户消息: {user_input[:500]}"
     if last_turn:
         user_msg += f"\n\n{last_turn}"
     try:

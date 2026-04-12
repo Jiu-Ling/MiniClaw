@@ -26,15 +26,19 @@ def build_memory_context(
     resolved_memory_file = memory_file or getattr(store, "memory_file_store", None)
     sections: list[str] = []
 
-    # 1. Long-term Facts — always injected
+    char_budget = memory_token_budget * _CHARS_PER_TOKEN
+    facts_budget = char_budget // 2  # Facts get at most half the budget
+
+    # 1. Long-term Facts — budget-capped (was "always injected" with no limit)
     if resolved_memory_file is not None:
         document = resolved_memory_file.read()
         if document.long_term_facts:
-            sections.append(
-                "\n".join(
-                    ["## Long-term Facts", *[f"- {fact}" for fact in document.long_term_facts]]
-                )
+            facts_text = "\n".join(
+                ["## Long-term Facts", *[f"- {fact}" for fact in document.long_term_facts]]
             )
+            if len(facts_text) > facts_budget:
+                facts_text = facts_text[:facts_budget] + "\n...[facts truncated]"
+            sections.append(facts_text)
 
     # 2. Related Context — on-demand retrieval
     if retriever is not None and user_input:
@@ -83,10 +87,15 @@ def build_memory_context(
     return "\n\n".join(sections)
 
 
+_MAX_MEMORY_SECTION_CHARS = 4000
+
+
 def render_memory_section(memory_context: str) -> str:
     memory_context = memory_context.strip()
     if not memory_context:
         return ""
+    if len(memory_context) > _MAX_MEMORY_SECTION_CHARS:
+        memory_context = memory_context[:_MAX_MEMORY_SECTION_CHARS] + "\n...[memory truncated]"
     return f"## {MEMORY_SECTION_TITLE}\n{memory_context}"
 
 

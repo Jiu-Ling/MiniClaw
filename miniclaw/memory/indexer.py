@@ -10,8 +10,33 @@ from typing import Any
 
 import sqlite_vec
 
+import re as _re
+
 from miniclaw.memory.chunker import Chunk, chunk_daily_file
 from miniclaw.memory.embedding import OllamaEmbedder
+
+_MAX_CHUNK_INDEX_CHARS = 500
+
+
+def _clean_for_indexing(content: str) -> str:
+    """Strip noise (tables, code blocks) and truncate before embedding."""
+    # Strip markdown tables
+    lines = content.splitlines()
+    lines = [ln for ln in lines if not _re.match(r"^\s*\|", ln)]
+    # Strip code blocks
+    in_code = False
+    cleaned: list[str] = []
+    for ln in lines:
+        if ln.strip().startswith("```"):
+            in_code = not in_code
+            continue
+        if not in_code:
+            cleaned.append(ln)
+    text = "\n".join(cleaned)
+    text = _re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(text) > _MAX_CHUNK_INDEX_CHARS:
+        text = text[:_MAX_CHUNK_INDEX_CHARS]
+    return text
 
 
 class MemoryIndexer:
@@ -96,6 +121,15 @@ class MemoryIndexer:
             for i in new_by_index
             if i in old_by_index and old_by_index[i]["content"] != new_by_index[i].content
         ]
+
+        # Clean content before embedding: strip tables, code blocks, truncate.
+        # Chunk is frozen, so we replace with cleaned copies.
+        to_add = [Chunk(content=_clean_for_indexing(c.content), chunk_index=c.chunk_index,
+                        kind=c.kind, metadata=c.metadata)
+                  for c in to_add]
+        to_update = [(old, Chunk(content=_clean_for_indexing(new.content), chunk_index=new.chunk_index,
+                                  kind=new.kind, metadata=new.metadata))
+                     for old, new in to_update]
 
         # Embed all new/changed content in one batch
         texts_to_embed = [c.content for c in to_add] + [new.content for _, new in to_update]

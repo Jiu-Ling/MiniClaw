@@ -1,7 +1,35 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+def compress_memory_entry(text: str, max_chars: int = 200) -> str:
+    """Compress a memory entry by stripping tables, code blocks, and truncating.
+
+    Goal: a single weather forecast table (20+ lines) becomes "weather: 24C cloudy".
+    """
+    if not text:
+        return text
+    # Strip markdown tables (lines starting/containing |...|)
+    lines = text.splitlines()
+    lines = [ln for ln in lines if not re.match(r"^\s*\|", ln)]
+    # Strip code blocks
+    in_code = False
+    cleaned: list[str] = []
+    for ln in lines:
+        if ln.strip().startswith("```"):
+            in_code = not in_code
+            continue
+        if not in_code:
+            cleaned.append(ln)
+    # Collapse multiple blank lines
+    text = "\n".join(cleaned)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(text) > max_chars:
+        text = text[:max_chars] + "..."
+    return text
 
 
 @dataclass(slots=True)
@@ -43,7 +71,7 @@ class MemoryFileStore:
 
     def append_recent_work(self, thread_key: str, entry: str) -> None:
         thread_key = thread_key.strip()
-        entry = entry.strip()
+        entry = compress_memory_entry(entry.strip())
         if not thread_key or not entry:
             return
 

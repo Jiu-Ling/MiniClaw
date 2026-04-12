@@ -650,6 +650,12 @@ class RuntimeService:
                 metadata={"thread_id": thread_id},
             )
         self._safe_memory_write(lambda: self._consolidate_thread_memory(thread_id, trace_context=consolidate_span))
+        # Decay old memories (fading: older → shorter → gone after 30 days)
+        if self.memory_file_store is not None:
+            from miniclaw.memory.decay import decay_memory
+            self._safe_memory_write(
+                lambda: decay_memory(self.memory_file_store, self.clock().date())
+            )
         _safe_finish_span(
             self.tracer,
             consolidate_span,
@@ -810,7 +816,7 @@ class RuntimeService:
             },
         }
 
-    _DIGEST_OUTCOME_MAX_CHARS = 300
+    _DIGEST_OUTCOME_MAX_CHARS = 120
 
     def _build_thread_digest(
         self,

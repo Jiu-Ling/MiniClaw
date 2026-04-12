@@ -154,7 +154,7 @@ async def run_subagent(
     rounds_used = 0
     consecutive_errors = 0
     final_usage: dict[str, Any] = {}
-    max_result_chars = int(getattr(settings, "max_tool_result_chars", 16_000) or 16_000)
+    max_result_chars = int(getattr(settings, "subagent_max_tool_result_chars", 2_000) or 2_000)
 
     try:
         for round_idx in range(settings.max_tool_rounds):
@@ -262,6 +262,21 @@ async def run_subagent(
                     tool_call_id=msg_dict.get("tool_call_id", ""),
                     content=msg_dict.get("content", ""),
                 ))
+
+            # Truncate any oversized assistant messages to prevent context
+            # explosion from large model completions (e.g., executor generating
+            # 10k+ chars of markdown that gets re-sent every round).
+            _MAX_ASSISTANT_CHARS = 4000
+            for idx_msg in range(len(messages)):
+                msg = messages[idx_msg]
+                if getattr(msg, "role", "") == "assistant":
+                    content = getattr(msg, "content", "") or ""
+                    if len(content) > _MAX_ASSISTANT_CHARS:
+                        messages[idx_msg] = ChatMessage(
+                            role="assistant",
+                            content=content[:_MAX_ASSISTANT_CHARS] + "\n...[response truncated]",
+                            tool_calls=getattr(msg, "tool_calls", None),
+                        )
 
             _safe_tracer_call(
                 tracer.finish_span, round_span,

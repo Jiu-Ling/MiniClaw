@@ -235,7 +235,10 @@ class ContextBuilder:
 
     @staticmethod
     def _format_bootstrap_file(name: str, content: str) -> str:
-        return f"## {name}\n{content.strip()}"
+        text = content.strip()
+        if len(text) > 2000:
+            text = text[:2000] + "\n...[truncated — see full file]"
+        return f"## {name}\n{text}"
 
     def _build_default_system_prompt(self) -> str:
         workspace_path = str(self.workspace.expanduser().resolve())
@@ -273,9 +276,7 @@ class ContextBuilder:
                 f"- Platform guidance: {platform_policy}",
                 "",
                 "## Memory",
-                "- SOUL.md defines stable style and identity guidance.",
-                "- .miniclaw/MEMORY.md stores curated long-term facts and recent work.",
-                "- SQLite-backed runtime memory and checkpoints store thread-local execution history and recovery state.",
+                "- MEMORY.md stores curated long-term facts. SQLite stores thread-local history.",
             ]
         ).strip()
 

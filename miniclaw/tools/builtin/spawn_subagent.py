@@ -108,8 +108,9 @@ def build_spawn_subagent_tool(
                 },
             )
 
+        capped_result = result.result[:4000] if len(result.result) > 4000 else result.result
         return ToolResult(
-            content=f"status: completed\nresult: {result.result}",
+            content=f"status: completed\nresult: {capped_result}",
             metadata={
                 "sub_id": result.sub_id,
                 "fleet_id": result.fleet_id,

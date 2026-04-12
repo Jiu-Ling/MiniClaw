@@ -95,7 +95,15 @@ def _render_entry(entry: CapabilityEntry) -> str:
 
     parts = [f"- {entry.name}"]
     if description:
-        parts.append(f": {description}")
+        # Active entries get full description; inactive get first sentence (≤60 chars)
+        if entry.active or entry.always_active:
+            parts.append(f": {description}")
+        else:
+            short = description.split(".")[0].strip()
+            if len(short) > 60:
+                short = short[:57] + "..."
+            if short:
+                parts.append(f": {short}")
 
     children = [child.strip() for child in entry.children if child.strip()]
     if children:

@@ -69,6 +69,10 @@ class HybridRetriever:
 
         scores = _rrf_fuse(fts_filtered, vec_filtered)
 
+        # Filter out low-relevance noise before selecting top-k
+        _MIN_RRF_SCORE = 0.01
+        scores = {cid: s for cid, s in scores.items() if s >= _MIN_RRF_SCORE}
+
         sorted_ids = sorted(scores, key=scores.get, reverse=True)[:top_k]
 
         results: list[RetrievedChunk] = []
