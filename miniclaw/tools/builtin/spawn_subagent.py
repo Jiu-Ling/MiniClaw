@@ -108,16 +108,50 @@ def build_spawn_subagent_tool(
                 },
             )
 
-        capped_result = result.result[:4000] if len(result.result) > 4000 else result.result
+        _MAX_INLINE_RESULT_CHARS = 4000
+        full_result = result.result or ""
+        result_metadata: dict[str, Any] = {
+            "sub_id": result.sub_id,
+            "fleet_id": result.fleet_id,
+            "role": result.role,
+            "rounds_used": result.rounds_used,
+            "summary": result.summary,
+        }
+
+        if len(full_result) <= _MAX_INLINE_RESULT_CHARS:
+            return ToolResult(
+                content=f"status: completed\nresult: {full_result}",
+                metadata=result_metadata,
+            )
+
+        # Result too long for inline return — persist to user sandbox so main
+        # agent can read_file if it needs the full content.
+        sandbox = str(subagent_runtime_metadata.get("user_sandbox", "")).strip()
+        if sandbox:
+            from pathlib import Path
+            spill_dir = Path(sandbox) / ".subagent_results"
+            spill_dir.mkdir(parents=True, exist_ok=True)
+            spill_path = spill_dir / f"{sub_id}.md"
+            try:
+                spill_path.write_text(full_result, encoding="utf-8")
+                result_metadata["full_result_path"] = str(spill_path)
+                truncated = full_result[:_MAX_INLINE_RESULT_CHARS]
+                return ToolResult(
+                    content=(
+                        f"status: completed\n"
+                        f"result (truncated, {len(full_result):,} chars total):\n"
+                        f"{truncated}\n...\n"
+                        f"[full result saved to: {spill_path}]"
+                    ),
+                    metadata=result_metadata,
+                )
+            except OSError:
+                pass  # Fall through to truncate-only path
+
+        # No sandbox or write failed — truncate only
         return ToolResult(
-            content=f"status: completed\nresult: {capped_result}",
-            metadata={
-                "sub_id": result.sub_id,
-                "fleet_id": result.fleet_id,
-                "role": result.role,
-                "rounds_used": result.rounds_used,
-                "summary": result.summary,
-            },
+            content=f"status: completed\nresult: {full_result[:_MAX_INLINE_RESULT_CHARS]}...[truncated {len(full_result):,} chars]",
+            metadata=result_metadata,
         )
 
     return RegisteredTool(
