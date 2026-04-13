@@ -692,11 +692,20 @@ function renderSummary(trace) {
   document.getElementById("summary-bar").innerHTML = parts.join("");
 }
 
+function traceActivityTs(trace) {
+  // "Last activity" for sorting: prefer end_ts (finished traces) falling
+  // back to start_ts (running traces). Running traces with a recent
+  // start_ts naturally stay at top; when they finish, end_ts updates to
+  // the last span's end and they remain at top.
+  return trace.end_ts || trace.start_ts || "";
+}
+
 function renderTracesList() {
   const container = document.getElementById("traces-list");
   container.innerHTML = "";
   const traces = Object.values(window.TRACE_DATA);
-  traces.sort((a, b) => (a.start_ts || "").localeCompare(b.start_ts || ""));
+  // Newest first: sort by last-activity timestamp, descending.
+  traces.sort((a, b) => traceActivityTs(b).localeCompare(traceActivityTs(a)));
   document.getElementById("trace-count-badge").textContent = traces.length + " traces";
   for (const trace of traces) {
     const isActive = trace.trace_id === state.activeTraceId;
@@ -1007,10 +1016,16 @@ function renderTimeline() {
   }
 }
 
-function selectTrace(tid) {
+function selectTrace(tid, options) {
+  const preserveState = options && options.preserveState;
+  const sameTrace = state.activeTraceId === tid;
   state.activeTraceId = tid;
-  state.selectedSpanId = null;
-  state.collapsed.clear();
+  // Preserve selection + collapse state on auto-refresh of the same trace.
+  // Only reset when the user explicitly clicks a different trace.
+  if (!preserveState && !sameTrace) {
+    state.selectedSpanId = null;
+    state.collapsed.clear();
+  }
   renderTracesList();
   renderTree();
   renderDetails();
@@ -1073,13 +1088,18 @@ function setLiveStatus(kind, label) {
 }
 
 function initFromData() {
-  const firstTid = Object.keys(window.TRACE_DATA)[0];
-  if (firstTid) {
-    // Preserve the user's active selection if still present.
+  // Pick the newest trace by last-activity ts (not insertion order).
+  const traceList = Object.values(window.TRACE_DATA);
+  traceList.sort((a, b) => traceActivityTs(b).localeCompare(traceActivityTs(a)));
+  const newestTid = traceList.length ? traceList[0].trace_id : null;
+
+  if (newestTid) {
     if (state.activeTraceId && window.TRACE_DATA[state.activeTraceId]) {
-      selectTrace(state.activeTraceId);
+      // Same trace still present: auto-refresh path — preserve folded/
+      // selected state so the view doesn't jump around when SSE fires.
+      selectTrace(state.activeTraceId, { preserveState: true });
     } else {
-      selectTrace(firstTid);
+      selectTrace(newestTid);
     }
   } else {
     document.getElementById("tree-container").innerHTML =
@@ -1418,7 +1438,7 @@ def run_server(
 # ----------------------------------------------------------------------
 
 def default_trace_path() -> Path:
-    return Path.home() / ".miniclaw" / "traces" / "miniclaw.jsonl"
+    return Path(__file__).parent.parent / ".miniclaw" / "traces" / "miniclaw.jsonl"
 
 
 def main() -> int:
