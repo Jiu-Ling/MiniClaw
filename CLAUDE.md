@@ -110,3 +110,7 @@ Pairing system: 6-digit random code → `miniclaw pair <code>` → authorized. C
 - **Immutable state**: RuntimeState flows through graph nodes; new state returned per step
 - **Protocol-based channels**: Declarative capability negotiation with automatic fallback
 - **HTML parse_mode**: Telegram uses HTML (not MarkdownV2) for reliability
+
+## Pending / Deferred Work
+
+- **Subagent result verification** — layered verification funnel (`verification_commands` → citation check → tool-equipped judge) with Reflexion retry. Spec: `docs/superpowers/specs/2026-04-14-subagent-verification-design.md`. Status: awaiting user decision on phase scope before implementation.
