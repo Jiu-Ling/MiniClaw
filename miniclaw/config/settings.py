@@ -106,6 +106,10 @@ class Settings(BaseSettings):
     # Heartbeat
     heartbeat_interval_s: int = 900
 
+    # Background scheduler (fire-and-forget jobs; see runtime/background.py)
+    background_max_queue: int = 32
+    background_stop_timeout_s: float = 5.0
+
     # Prompt caching (DashScope cache_control: ephemeral)
     enable_prompt_cache: bool = False
 
