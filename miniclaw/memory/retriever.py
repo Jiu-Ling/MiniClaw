@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 import struct
 from dataclasses import dataclass
@@ -10,6 +9,7 @@ from typing import Any
 import sqlite_vec
 
 from miniclaw.memory.embedding import OllamaEmbedder
+from miniclaw.utils.jsonx import safe_loads_dict
 
 _RRF_K = 60
 _RECALL_LIMIT = 50
@@ -78,9 +78,7 @@ class HybridRetriever:
         results: list[RetrievedChunk] = []
         for chunk_id in sorted_ids:
             meta = chunk_meta[chunk_id]
-            parsed_metadata = json.loads(meta.get("metadata_json", "{}"))
-            if not isinstance(parsed_metadata, dict):
-                parsed_metadata = {}
+            parsed_metadata = safe_loads_dict(meta.get("metadata_json", "{}"))
             results.append(
                 RetrievedChunk(
                     chunk_id=chunk_id,
@@ -174,9 +172,5 @@ def _rrf_fuse(
 
 
 def _extract_date(meta: dict[str, Any]) -> str:
-    metadata_json = meta.get("metadata_json", "{}")
-    try:
-        parsed = json.loads(metadata_json)
-        return parsed.get("date", "")
-    except (json.JSONDecodeError, TypeError):
-        return ""
+    parsed = safe_loads_dict(meta.get("metadata_json", "{}"))
+    return str(parsed.get("date", ""))
