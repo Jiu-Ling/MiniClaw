@@ -78,7 +78,47 @@ def safe_loads_with_raw(text: Any) -> dict[str, Any]:
 
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL)
-_FIRST_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _find_first_json_object(text: str) -> str | None:
+    """Find the first balanced {...} block in text via linear brace counting.
+
+    Returns the substring including the outer braces, or None if no balanced
+    object is found. Tracks string literals and backslash escapes so that
+    braces inside strings do not affect depth.
+
+    O(n) in the length of text; no backtracking. Used by extract_json_object
+    to locate JSON payloads embedded in LLM prose without ReDoS risk.
+    """
+    start = -1
+    depth = 0
+    in_string = False
+    escape = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth == 0:
+                continue  # unbalanced } before any {; skip
+            depth -= 1
+            if depth == 0 and start != -1:
+                return text[start : i + 1]
+    return None
 
 
 def extract_json_object(
@@ -90,7 +130,7 @@ def extract_json_object(
     Tries in order:
       1. Strip markdown code fences and parse the inner content
       2. Parse the whole text directly
-      3. Regex out the first {...} balanced block and parse that
+      3. Scan for the first balanced {...} block via O(n) brace counting
       4. Return default (or {}) on all failures
 
     This is the right helper for LLM outputs. Do NOT use it for trusted
@@ -98,6 +138,9 @@ def extract_json_object(
 
     Deliberate non-feature: single-quoted "JSON" is not repaired. Aggressive
     repair is out of scope; mini models are expected to emit valid JSON.
+
+    An empty JSON object ({}) from the model is a valid result and is
+    returned as-is; it is distinguished from parse failure internally.
     """
     fallback = default if default is not None else {}
     if not isinstance(text, str) or not text:
@@ -107,20 +150,20 @@ def extract_json_object(
     fence_match = _FENCE_RE.search(text)
     if fence_match:
         candidate = fence_match.group(1).strip()
-        parsed = safe_loads_dict(candidate, default=None)
-        if parsed:
+        parsed = safe_loads(candidate, default=None)
+        if isinstance(parsed, dict):
             return parsed
 
     # Try 2: whole-text parse
-    parsed = safe_loads_dict(text.strip(), default=None)
-    if parsed:
+    parsed = safe_loads(text.strip(), default=None)
+    if isinstance(parsed, dict):
         return parsed
 
-    # Try 3: first balanced {...} block via greedy regex
-    obj_match = _FIRST_OBJECT_RE.search(text)
-    if obj_match:
-        parsed = safe_loads_dict(obj_match.group(0), default=None)
-        if parsed:
+    # Try 3: first balanced {...} block via linear scan (ReDoS-safe)
+    candidate = _find_first_json_object(text)
+    if candidate is not None:
+        parsed = safe_loads(candidate, default=None)
+        if isinstance(parsed, dict):
             return parsed
 
     return dict(fallback)
