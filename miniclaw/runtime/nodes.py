@@ -259,6 +259,7 @@ def make_load_context(
     mini_provider: ChatProvider | None = None,
     main_provider: ChatProvider | None = None,
     settings: object | None = None,
+    tracer: object | None = None,
 ) -> Callable[[RuntimeState], RuntimeState]:
     def load_context(state: RuntimeState) -> RuntimeState:
         # Flush dirty index entries synchronously
@@ -268,6 +269,7 @@ def make_load_context(
         runtime_metadata = state.get("runtime_metadata") or {}
         thread_id = _resolve_thread_id(state, runtime_metadata)
         user_input = str(state.get("user_input", "")).strip()
+        parent_trace = _resolve_turn_trace(state, "graph.load_context") if tracer is not None else None
 
         rewrite_result = None
         if (
@@ -286,6 +288,10 @@ def make_load_context(
                     user_input=user_input,
                     recent_exchanges=recent,
                 )
+                rewrite_span = _safe_start_span(
+                    tracer, parent_trace, name="memory.rewrite",
+                    metadata={"model_tier": str(getattr(settings, "memory_rewrite_model_tier", "auto"))},
+                )
                 try:
                     rewrite_result = _run_provider_sync(
                         rewrite_query(
@@ -297,9 +303,31 @@ def make_load_context(
                     )
                 except Exception:
                     rewrite_result = None
+                _safe_finish_span(
+                    tracer, rewrite_span,
+                    status="ok" if (rewrite_result and rewrite_result.used_llm) else "fallback",
+                    outputs=(
+                        {
+                            "used_llm": rewrite_result.used_llm,
+                            "intent": rewrite_result.intent,
+                            "latency_ms": rewrite_result.latency_ms,
+                            "failure_reason": rewrite_result.failure_reason,
+                            "keywords_count": len(rewrite_result.keywords),
+                        }
+                        if rewrite_result is not None
+                        else {"used_llm": False, "failure_reason": "exception"}
+                    ),
+                )
 
         memory_context = ""
         if thread_id:
+            retrieve_span = _safe_start_span(
+                tracer, parent_trace, name="memory.retrieve",
+                metadata={
+                    "thread_id": thread_id,
+                    "intent": rewrite_result.intent if rewrite_result else "ambiguous",
+                },
+            )
             memory_context = build_memory_context(
                 memory_store,
                 thread_id,
@@ -307,6 +335,11 @@ def make_load_context(
                 user_input=user_input,
                 memory_token_budget=memory_token_budget,
                 rewrite=rewrite_result,
+            )
+            _safe_finish_span(
+                tracer, retrieve_span,
+                status="ok",
+                outputs={"memory_context_chars": len(memory_context)},
             )
 
         planner_context = ""
@@ -342,6 +375,36 @@ def _resolve_rewrite_model(settings: object) -> str:
     if mini:
         return str(mini)
     return str(getattr(settings, "model", "") or "")
+
+
+def _safe_start_span(
+    tracer: object | None,
+    parent: Any,
+    *,
+    name: str,
+    metadata: dict[str, Any] | None = None,
+) -> Any:
+    if tracer is None or parent is None:
+        return None
+    try:
+        return tracer.start_span(parent, name=name, metadata=metadata)
+    except Exception:
+        return None
+
+
+def _safe_finish_span(
+    tracer: object | None,
+    span: Any,
+    *,
+    status: str,
+    outputs: dict[str, Any] | None = None,
+) -> None:
+    if tracer is None or span is None:
+        return
+    try:
+        tracer.finish_span(span, status=status, outputs=outputs)
+    except Exception:
+        pass
 
 
 def _extract_recent_exchanges(

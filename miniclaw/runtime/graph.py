@@ -170,6 +170,7 @@ def build_graph(
             mini_provider=mini_provider,
             main_provider=provider,
             settings=settings,
+            tracer=resolved_tracer,
         ),
     ))
     graph.add_node("planner", wrap(
