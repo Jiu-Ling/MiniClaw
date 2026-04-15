@@ -114,3 +114,4 @@ Pairing system: 6-digit random code → `miniclaw pair <code>` → authorized. C
 ## Pending / Deferred Work
 
 - **Subagent result verification** — layered verification funnel (`verification_commands` → citation check → tool-equipped judge) with Reflexion retry. Spec: `docs/superpowers/specs/2026-04-14-subagent-verification-design.md`. Status: awaiting user decision on phase scope before implementation.
+- **LLM memory summarizer + retrieval overhaul** — BackgroundScheduler + parent-child chunking + LLM rewrite with intent routing + LLM consolidation with critical/normal tiering. Destructive migration via `miniclaw memory rebuild` CLI. Hard constraint: subsystem LoC must trend negative. Spec: `docs/superpowers/specs/2026-04-15-llm-memory-summarizer-design.md`. Status: awaiting user review before implementation.
