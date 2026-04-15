@@ -7,6 +7,7 @@ from miniclaw.providers.contracts import ChatMessage, ChatResponse
 from miniclaw.runtime.state import ActiveCapabilities, RuntimeMessage, RuntimeState
 from miniclaw.tools.contracts import ToolCall, ToolResult
 from miniclaw.tools.registry import ToolRegistry
+from miniclaw.utils.jsonx import safe_loads_with_raw
 
 if TYPE_CHECKING:
     from miniclaw.observability.contracts import Tracer
@@ -125,10 +126,7 @@ def trace_tool_calls(tool_calls: list[dict[str, Any]] | None) -> list[dict[str, 
         fn = tc.get("function", {}) if isinstance(tc, dict) else {}
         name = fn.get("name", "") if isinstance(fn, dict) else ""
         args_raw = fn.get("arguments", "") if isinstance(fn, dict) else ""
-        try:
-            args = json.loads(args_raw) if isinstance(args_raw, str) else dict(args_raw or {})
-        except (json.JSONDecodeError, TypeError):
-            args = {"raw": str(args_raw)}
+        args = safe_loads_with_raw(args_raw)
         out.append({
             "id": tc.get("id") if isinstance(tc, dict) else None,
             "name": str(name),
