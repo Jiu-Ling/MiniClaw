@@ -1,16 +1,10 @@
 """JSON parsing helpers with consistent fallback semantics.
 
-Three idioms covered:
-  - safe_loads(text, default)        — strict parse, default on failure
-  - safe_loads_dict(text, default)   — enforces dict type (most common)
-  - safe_loads_with_raw(text)        — {"raw": str(text)} wrapper on failure
-  - extract_json_object(text)        — LLM-output-aware: strips code fences,
-                                       pulls first balanced {...} block
-
-Use extract_json_object for LLM outputs (rewrite, consolidation, future
-subagent judge). Use safe_loads_dict for trusted JSON from disk or DB.
-Use safe_loads_with_raw only when downstream code wants access to
-unparseable input for debugging (tool-call argument parsers).
+Four idioms:
+  - safe_loads(text, default)        → parse or return default
+  - safe_loads_dict(text, default)   → parse or return default dict
+  - safe_loads_with_raw(text)        → parse or return {"raw": text}
+  - extract_json_object(text)        → LLM output: strip fences, find {...}
 """
 from __future__ import annotations
 
@@ -55,13 +49,7 @@ def safe_loads_dict(
 
 
 def safe_loads_with_raw(text: Any) -> dict[str, Any]:
-    """Parse JSON, falling back to {"raw": <original>} on any failure.
-
-    Used by tool-call argument parsers in nodes.py / tool_loop.py where
-    downstream code still wants access to unparseable input for debugging.
-    If the input is already a dict, it is returned unchanged. Empty input
-    returns an empty dict.
-    """
+    """Parse JSON, fallback to {"raw": <original>}. Dict passthrough; empty → {}."""
     if text is None or text == "":
         return {}
     if isinstance(text, dict):
@@ -81,14 +69,10 @@ _FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL)
 
 
 def _find_first_json_object(text: str) -> str | None:
-    """Find the first balanced {...} block in text via linear brace counting.
+    """Find first balanced {...} block via O(n) brace counting.
 
-    Returns the substring including the outer braces, or None if no balanced
-    object is found. Tracks string literals and backslash escapes so that
-    braces inside strings do not affect depth.
-
-    O(n) in the length of text; no backtracking. Used by extract_json_object
-    to locate JSON payloads embedded in LLM prose without ReDoS risk.
+    Handles string literals and escapes; no backtracking. Returns substring
+    with braces or None if not found.
     """
     start = -1
     depth = 0
@@ -125,22 +109,10 @@ def extract_json_object(
     text: Any,
     default: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Extract a JSON object from LLM output that may contain prose or fences.
+    """Extract JSON object from LLM output (prose + fences).
 
-    Tries in order:
-      1. Strip markdown code fences and parse the inner content
-      2. Parse the whole text directly
-      3. Scan for the first balanced {...} block via O(n) brace counting
-      4. Return default (or {}) on all failures
-
-    This is the right helper for LLM outputs. Do NOT use it for trusted
-    JSON from disk — use safe_loads_dict instead.
-
-    Deliberate non-feature: single-quoted "JSON" is not repaired. Aggressive
-    repair is out of scope; mini models are expected to emit valid JSON.
-
-    An empty JSON object ({}) from the model is a valid result and is
-    returned as-is; it is distinguished from parse failure internally.
+    Tries: (1) unfenced content, (2) whole text, (3) first {...} block, (4) default.
+    Single-quoted JSON is not repaired. Empty {} is a valid result.
     """
     fallback = default if default is not None else {}
     if not isinstance(text, str) or not text:
