@@ -77,6 +77,7 @@ class RuntimeService:
         mini_provider: OpenAICompatibleProvider | None = None,
         tracer: TraceContext | None = None,
         clock: object | None = None,
+        background_scheduler: object | None = None,
     ) -> None:
         self.settings = settings
         self.provider = provider
@@ -89,6 +90,7 @@ class RuntimeService:
         self.mini_provider = mini_provider
         self.tracer = tracer or NoopTracer()
         self.clock = clock if callable(clock) else _utc_now
+        self.background_scheduler = background_scheduler
         self._checkpointer = AsyncSQLiteCheckpointer(settings.sqlite_path)
         self._persist_app = self._build_persist_app()
         self._compression_synced_threads: set[str] = set()
@@ -895,6 +897,36 @@ class RuntimeService:
             action()
         except Exception:
             return
+
+    def _dispatch_background(self, job) -> None:
+        """Submit a BackgroundJob to the scheduler, or run it synchronously.
+
+        When background_scheduler is configured, submits the job. On submit
+        failure (e.g., queue full raising, although the implementation
+        returns False), or when no scheduler is set, runs job.fn() directly
+        and routes exceptions through job.on_failure. Never raises.
+        """
+        if self.background_scheduler is not None:
+            try:
+                self.background_scheduler.submit(job)
+                return
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception(
+                    "scheduler.submit failed; falling back to sync for kind=%s",
+                    getattr(job, "kind", "unknown"),
+                )
+        try:
+            job.fn()
+        except Exception as exc:
+            if getattr(job, "on_failure", None) is not None:
+                try:
+                    job.on_failure(exc)
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).exception(
+                        "on_failure raised during sync fallback"
+                    )
 
 
 def _utc_now() -> datetime:
