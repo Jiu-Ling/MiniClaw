@@ -20,6 +20,7 @@ from miniclaw.channels.telegram.channel import TelegramChannel
 from miniclaw.commands.builtin import register_builtin_commands
 from miniclaw.commands.registry import CommandRegistry
 from miniclaw.cron.service import CronService
+from miniclaw.utils.jsonx import safe_loads
 
 app = typer.Typer(
     name="miniclaw",
@@ -43,7 +44,6 @@ def trace_tail(
     follow: bool = typer.Option(True, "--follow/--no-follow"),
 ) -> None:
     """Pretty-print a trace JSONL file with hierarchical indentation."""
-    import json
     import time
 
     if not path.exists():
@@ -86,10 +86,10 @@ def trace_tail(
             line = line.strip()
             if not line:
                 continue
-            try:
-                _print_record(json.loads(line))
-            except json.JSONDecodeError:
+            parsed = safe_loads(line)
+            if parsed is None:
                 continue
+            _print_record(parsed)
 
         if not follow:
             return
@@ -102,10 +102,9 @@ def trace_tail(
                     continue
                 line = line.strip()
                 if line:
-                    try:
-                        _print_record(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
+                    parsed = safe_loads(line)
+                    if parsed is not None:
+                        _print_record(parsed)
         except KeyboardInterrupt:
             return
 
