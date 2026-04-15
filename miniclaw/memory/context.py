@@ -40,24 +40,27 @@ def build_memory_context(
                 facts_text = facts_text[:facts_budget] + "\n...[facts truncated]"
             sections.append(facts_text)
 
-    # 2. Related Context — on-demand retrieval
+    # 2. Related Context — adaptive parent-child assembly
     if retriever is not None and user_input:
         search = getattr(retriever, "search", None)
         if callable(search):
-            chunks = _run_sync(search(user_input, top_k=20))
+            chunks = _run_sync(search(user_input, top_k=5))
             if chunks:
-                char_budget = memory_token_budget * _CHARS_PER_TOKEN
-                retrieved_lines: list[str] = []
-                used_chars = 0
-                for chunk in chunks:
-                    chunk_chars = len(chunk.content)
-                    if used_chars + chunk_chars > char_budget:
-                        break
-                    retrieved_lines.append(f"[{chunk.created_at[:10]}] {chunk.content}")
-                    used_chars += chunk_chars
-                if retrieved_lines:
+                from miniclaw.memory.retriever import assemble_adaptive
+                parent_loader = getattr(retriever, "load_parent", None)
+                neighbor_loader = getattr(retriever, "load_neighbors", None)
+                if callable(parent_loader) and callable(neighbor_loader):
+                    assembled = assemble_adaptive(
+                        chunks,
+                        budget_chars=char_budget,
+                        parent_loader=parent_loader,
+                        neighbor_loader=lambda ch: neighbor_loader(ch, radius=1),
+                    )
+                else:
+                    assembled = [c.content for c in chunks]
+                if assembled:
                     sections.append(
-                        "\n".join(["## Related Context", *retrieved_lines])
+                        "\n".join(["## Related Context", *assembled])
                     )
 
     # 3. Fallback: if no retriever and no memory_file, use old behavior
