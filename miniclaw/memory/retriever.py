@@ -4,7 +4,7 @@ import sqlite3
 import struct
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Literal
 
 import sqlite_vec
 
@@ -24,6 +24,7 @@ class RetrievedChunk:
     kind: str
     created_at: str
     metadata: dict[str, Any]
+    parent_id: str | None = None
 
 
 class HybridRetriever:
@@ -37,11 +38,13 @@ class HybridRetriever:
         *,
         top_k: int = 10,
         thread_id: str | None = None,
+        thread_scope: Literal["current", "global", "current_then_global"] = "current_then_global",
+        keywords: tuple[str, ...] = (),
         date_range: tuple[str, str] | None = None,
     ) -> list[RetrievedChunk]:
         query_vec = await self.embedder.embed_one(query)
 
-        fts_ranked = self._fts_search(query)
+        fts_ranked = self._fts_search(query, keywords)
         vec_ranked = self._vec_search(query_vec)
 
         all_chunk_ids = {cid for cid, _ in fts_ranked} | {cid for cid, _ in vec_ranked}
@@ -50,12 +53,7 @@ class HybridRetriever:
 
         chunk_meta = self._load_chunk_metadata(all_chunk_ids)
 
-        # Apply metadata filters
-        if thread_id is not None:
-            chunk_meta = {
-                cid: meta for cid, meta in chunk_meta.items()
-                if meta.get("thread_id") == thread_id
-            }
+        # Apply date_range filter
         if date_range is not None:
             start, end = date_range
             chunk_meta = {
@@ -63,6 +61,43 @@ class HybridRetriever:
                 if start <= _extract_date(meta) <= end
             }
 
+        def _apply_thread_filter(meta_dict: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+            """Filter by current thread, but always keep long_term_fact chunks."""
+            return {
+                cid: meta for cid, meta in meta_dict.items()
+                if meta.get("thread_id") == thread_id or meta.get("kind") == "long_term_fact"
+            }
+
+        if thread_scope == "global" or thread_id is None:
+            filtered_meta = chunk_meta
+        elif thread_scope == "current":
+            filtered_meta = _apply_thread_filter(chunk_meta)
+        else:  # current_then_global
+            filtered_meta = _apply_thread_filter(chunk_meta)
+
+        results = self._score_and_build(filtered_meta, fts_ranked, vec_ranked, top_k=top_k)
+
+        # current_then_global fallback: if fewer than top_k, widen to global and merge
+        if thread_scope == "current_then_global" and thread_id is not None and len(results) < top_k:
+            seen_ids = {r.chunk_id for r in results}
+            global_results = self._score_and_build(chunk_meta, fts_ranked, vec_ranked, top_k=top_k)
+            for r in global_results:
+                if r.chunk_id not in seen_ids:
+                    results.append(r)
+                    seen_ids.add(r.chunk_id)
+                if len(results) >= top_k:
+                    break
+
+        return results[:top_k]
+
+    def _score_and_build(
+        self,
+        chunk_meta: dict[str, dict[str, Any]],
+        fts_ranked: list[tuple[str, int]],
+        vec_ranked: list[tuple[str, int]],
+        *,
+        top_k: int,
+    ) -> list[RetrievedChunk]:
         allowed_ids = set(chunk_meta.keys())
         fts_filtered = [(cid, rank) for cid, rank in fts_ranked if cid in allowed_ids]
         vec_filtered = [(cid, rank) for cid, rank in vec_ranked if cid in allowed_ids]
@@ -88,14 +123,24 @@ class HybridRetriever:
                     kind=meta["kind"],
                     created_at=meta["created_at"],
                     metadata=parsed_metadata,
+                    parent_id=meta.get("parent_id"),
                 )
             )
         return results
 
-    def _fts_search(self, query: str) -> list[tuple[str, int]]:
-        fts_query = _prepare_fts_query(query)
-        if not fts_query:
+    def _fts_search(
+        self,
+        query: str,
+        keywords: tuple[str, ...] = (),
+    ) -> list[tuple[str, int]]:
+        tokens = list(query.split())
+        for kw in keywords:
+            if kw and kw not in tokens:
+                tokens.append(kw)
+        if not tokens:
             return []
+        escaped = [t.replace('"', '""') for t in tokens]
+        fts_query = " OR ".join(f'"{t}"' for t in escaped)
         try:
             with sqlite3.connect(self.db_path) as conn:
                 rows = conn.execute(
@@ -125,7 +170,7 @@ class HybridRetriever:
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(
                 f"""
-                SELECT id, content, source_file, thread_id, kind, created_at, metadata_json
+                SELECT id, content, source_file, thread_id, kind, created_at, metadata_json, parent_id
                 FROM memory_chunks
                 WHERE id IN ({placeholders})
                 """,
@@ -139,6 +184,7 @@ class HybridRetriever:
                 "kind": row[4],
                 "created_at": row[5],
                 "metadata_json": row[6],
+                "parent_id": row[7],
             }
             for row in rows
         }
@@ -150,13 +196,46 @@ class HybridRetriever:
         conn.enable_load_extension(False)
         return conn
 
+    def load_parent(self, parent_id: str) -> str | None:
+        """Fetch the full content of a parent chunk by id. None if missing or table absent."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT content FROM memory_parents WHERE id = ?",
+                    (parent_id,),
+                ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        return row[0] if row else None
 
-def _prepare_fts_query(query: str) -> str:
-    tokens = query.split()
-    if not tokens:
-        return ""
-    escaped = [token.replace('"', '""') for token in tokens]
-    return " OR ".join(f'"{t}"' for t in escaped)
+    def load_neighbors(
+        self,
+        chunk: RetrievedChunk,
+        *,
+        radius: int = 1,
+    ) -> list[str]:
+        """Return chunk.content plus +/- radius neighbor siblings within the same parent."""
+        if not chunk.parent_id:
+            return [chunk.content]
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT content, chunk_index FROM memory_chunks
+                WHERE parent_id = ?
+                ORDER BY chunk_index
+                """,
+                (chunk.parent_id,),
+            ).fetchall()
+        if not rows:
+            return [chunk.content]
+        contents = [r[0] for r in rows]
+        try:
+            target_idx = next(i for i, r in enumerate(rows) if r[0] == chunk.content)
+        except StopIteration:
+            return [chunk.content]
+        lo = max(0, target_idx - radius)
+        hi = min(len(rows), target_idx + radius + 1)
+        return contents[lo:hi]
 
 
 def _rrf_fuse(
@@ -174,3 +253,59 @@ def _rrf_fuse(
 def _extract_date(meta: dict[str, Any]) -> str:
     parsed = safe_loads_dict(meta.get("metadata_json", "{}"))
     return str(parsed.get("date", ""))
+
+
+def assemble_adaptive(
+    matched: list[RetrievedChunk],
+    *,
+    budget_chars: int,
+    parent_loader: Callable[[str], str | None],
+    neighbor_loader: Callable[[RetrievedChunk], list[str]],
+) -> list[str]:
+    """Cluster matched children by parent; return prompt-ready strings.
+
+    Strategy:
+      - Group children by parent_id (orphans = long_term_fact with parent_id None)
+      - Rank parents by (hit_count DESC, total_score DESC)
+      - Parent with >=2 hits -> return full parent content (or joined hits as fallback)
+      - Parent with 1 hit -> return neighbor window (child + neighbors)
+      - Fit remaining budget with orphan facts ranked by score
+      - Stop when budget_chars would be exceeded
+    """
+    parent_groups: dict[str, list[RetrievedChunk]] = {}
+    orphans: list[RetrievedChunk] = []
+    for ch in matched:
+        if ch.parent_id:
+            parent_groups.setdefault(ch.parent_id, []).append(ch)
+        else:
+            orphans.append(ch)
+
+    ranked = sorted(
+        parent_groups.items(),
+        key=lambda kv: (len(kv[1]), sum(c.score for c in kv[1])),
+        reverse=True,
+    )
+
+    out: list[str] = []
+    used = 0
+
+    for parent_id, hits in ranked:
+        if len(hits) >= 2:
+            text = parent_loader(parent_id)
+            if text is None:
+                text = "\n".join(h.content for h in hits)
+        else:
+            neighbors = neighbor_loader(hits[0])
+            text = "\n".join(neighbors)
+        if used + len(text) > budget_chars:
+            break
+        out.append(text)
+        used += len(text)
+
+    for ch in sorted(orphans, key=lambda c: c.score, reverse=True):
+        if used + len(ch.content) > budget_chars:
+            break
+        out.append(ch.content)
+        used += len(ch.content)
+
+    return out
