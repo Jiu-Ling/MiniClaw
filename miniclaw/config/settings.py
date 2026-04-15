@@ -111,7 +111,7 @@ class Settings(BaseSettings):
     background_stop_timeout_s: float = 5.0
 
     # Memory rewrite (Phase 3)
-    memory_rewrite_enabled: bool = True
+    memory_rewrite_enabled: bool = False
     memory_rewrite_model_tier: Literal["mini", "main", "auto"] = "auto"
     memory_rewrite_timeout_s: float = 1.0
     memory_rewrite_recent_exchanges: int = 2

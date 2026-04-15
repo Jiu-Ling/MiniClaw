@@ -256,6 +256,9 @@ def make_load_context(
     retriever: object | None = None,
     indexer: MemoryIndexer | None = None,
     memory_token_budget: int = 2000,
+    mini_provider: ChatProvider | None = None,
+    main_provider: ChatProvider | None = None,
+    settings: object | None = None,
 ) -> Callable[[RuntimeState], RuntimeState]:
     def load_context(state: RuntimeState) -> RuntimeState:
         # Flush dirty index entries synchronously
@@ -266,6 +269,35 @@ def make_load_context(
         thread_id = _resolve_thread_id(state, runtime_metadata)
         user_input = str(state.get("user_input", "")).strip()
 
+        rewrite_result = None
+        if (
+            settings is not None
+            and getattr(settings, "memory_rewrite_enabled", True)
+            and user_input
+        ):
+            from miniclaw.memory.rewrite import RewriteInput, rewrite_query
+            provider = _select_rewrite_provider(settings, mini_provider, main_provider)
+            if provider is not None:
+                recent = _extract_recent_exchanges(
+                    state,
+                    n=int(getattr(settings, "memory_rewrite_recent_exchanges", 2) or 2),
+                )
+                rewrite_inputs = RewriteInput(
+                    user_input=user_input,
+                    recent_exchanges=recent,
+                )
+                try:
+                    rewrite_result = _run_provider_sync(
+                        rewrite_query(
+                            rewrite_inputs,
+                            provider=provider,
+                            model=_resolve_rewrite_model(settings),
+                            timeout_s=float(getattr(settings, "memory_rewrite_timeout_s", 1.0) or 1.0),
+                        )
+                    )
+                except Exception:
+                    rewrite_result = None
+
         memory_context = ""
         if thread_id:
             memory_context = build_memory_context(
@@ -274,6 +306,7 @@ def make_load_context(
                 retriever=retriever,
                 user_input=user_input,
                 memory_token_budget=memory_token_budget,
+                rewrite=rewrite_result,
             )
 
         planner_context = ""
@@ -286,6 +319,53 @@ def make_load_context(
         }
 
     return load_context
+
+
+def _select_rewrite_provider(
+    settings: object,
+    mini_provider: ChatProvider | None,
+    main_provider: ChatProvider | None,
+) -> ChatProvider | None:
+    tier = str(getattr(settings, "memory_rewrite_model_tier", "auto") or "auto")
+    if tier == "mini":
+        return mini_provider
+    if tier == "main":
+        return main_provider
+    return mini_provider or main_provider
+
+
+def _resolve_rewrite_model(settings: object) -> str:
+    tier = str(getattr(settings, "memory_rewrite_model_tier", "auto") or "auto")
+    if tier == "main":
+        return str(getattr(settings, "model", "") or "")
+    mini = getattr(settings, "mini_model", None)
+    if mini:
+        return str(mini)
+    return str(getattr(settings, "model", "") or "")
+
+
+def _extract_recent_exchanges(
+    state: RuntimeState,
+    *,
+    n: int,
+) -> tuple[tuple[str, str], ...]:
+    """Pull the last n (user, assistant) pairs from state.messages."""
+    messages = state.get("messages") or []
+    pairs: list[tuple[str, str]] = []
+    user_buffer: str | None = None
+    for msg in messages:
+        if isinstance(msg, dict):
+            role = msg.get("role")
+            content = msg.get("content", "") or ""
+        else:
+            role = getattr(msg, "role", None)
+            content = getattr(msg, "content", "") or ""
+        if role == "user":
+            user_buffer = str(content)
+        elif role == "assistant" and user_buffer is not None:
+            pairs.append((user_buffer, str(content)))
+            user_buffer = None
+    return tuple(pairs[-n:])
 
 
 def make_planner(

@@ -167,6 +167,9 @@ def build_graph(
             retriever=retriever,
             indexer=indexer,
             memory_token_budget=memory_token_budget,
+            mini_provider=mini_provider,
+            main_provider=provider,
+            settings=settings,
         ),
     ))
     graph.add_node("planner", wrap(
