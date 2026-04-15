@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import inspect
-import json
 import re
 import uuid
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from miniclaw.utils.async_bridge import run_sync as _run_provider_sync
+from miniclaw.utils.jsonx import safe_loads_with_raw
 
 from miniclaw.memory import build_memory_context
 from miniclaw.providers.contracts import ChatMessage, ChatProvider, ChatResponse
@@ -469,12 +469,7 @@ def make_agent(
                     for raw_call in response.tool_calls:
                         fn = raw_call.get("function", {})
                         tool_name = str(fn.get("name", ""))
-                        tool_args = fn.get("arguments", {})
-                        if isinstance(tool_args, str):
-                            try:
-                                tool_args = json.loads(tool_args)
-                            except Exception:
-                                tool_args = {"raw": tool_args}
+                        tool_args = safe_loads_with_raw(fn.get("arguments", {}))
                         _emit("tool_calling", text=tool_name, tool_name=tool_name, arguments=tool_args)
 
                     loop_state = apply_tool_calls(
@@ -494,12 +489,7 @@ def make_agent(
                     for i, raw_call in enumerate(response.tool_calls):
                         fn = raw_call.get("function", {})
                         tool_name = str(fn.get("name", ""))
-                        tool_args = fn.get("arguments", {})
-                        if isinstance(tool_args, str):
-                            try:
-                                tool_args = json.loads(tool_args)
-                            except Exception:
-                                tool_args = {"raw": tool_args}
+                        tool_args = safe_loads_with_raw(fn.get("arguments", {}))
                         result_text = ""
                         if i < len(recent_tool_msgs):
                             msg = recent_tool_msgs[i]
