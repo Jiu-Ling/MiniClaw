@@ -283,6 +283,7 @@ def build_runtime_service(
     langsmith_client: Any | None = None,
     memory_indexer: object | None = None,
     retriever: object | None = None,
+    background_scheduler: object | None = None,
 ) -> RuntimeService:
     resolved_settings = settings or build_settings()
     resolved_memory_store = memory_store or build_memory_store(resolved_settings.sqlite_path)
@@ -334,6 +335,7 @@ def build_runtime_service(
         memory_indexer=resolved_indexer,
         retriever=resolved_retriever,
         tracer=resolved_tracer,
+        background_scheduler=background_scheduler,
     )
 
 
