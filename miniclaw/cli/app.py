@@ -20,6 +20,7 @@ from miniclaw.channels.telegram.channel import TelegramChannel
 from miniclaw.commands.builtin import register_builtin_commands
 from miniclaw.commands.registry import CommandRegistry
 from miniclaw.cron.service import CronService
+from miniclaw.runtime.background import BackgroundScheduler
 from miniclaw.utils.jsonx import safe_loads
 
 app = typer.Typer(
@@ -280,6 +281,12 @@ async def _run_telegram_polling(*, timeout: int, offset: int | None, once: bool)
         )
         raise typer.Exit(code=1)
 
+    background_scheduler = BackgroundScheduler(
+        name="miniclaw-bg",
+        max_queue=settings.background_max_queue,
+    )
+    background_scheduler.start()
+
     mini_provider = build_mini_provider(settings)
 
     channel = TelegramChannel(bot_token=settings.telegram_bot_token, poll_timeout=timeout)
@@ -297,6 +304,7 @@ async def _run_telegram_polling(*, timeout: int, offset: int | None, once: bool)
             cron_service=_shared_cron_service,
             messaging_bridge=bridge,
             mini_provider=mini_provider,
+            background_scheduler=background_scheduler,
         )
 
     cron_service = build_cron_service(
@@ -311,6 +319,7 @@ async def _run_telegram_polling(*, timeout: int, offset: int | None, once: bool)
         cron_service=cron_service,
         mini_provider=mini_provider,
         messaging_bridge=bridge,
+        background_scheduler=background_scheduler,
     )
 
     commands = CommandRegistry()
@@ -344,6 +353,10 @@ async def _run_telegram_polling(*, timeout: int, offset: int | None, once: bool)
     finally:
         cron_service.stop()
         heartbeat_service.stop()
+        background_scheduler.stop(
+            wait=True,
+            timeout=settings.background_stop_timeout_s,
+        )
 
 
 def _build_cron_notify(channel: TelegramChannel):
