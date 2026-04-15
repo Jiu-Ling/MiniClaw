@@ -8,6 +8,8 @@ from typing import Any, Protocol, runtime_checkable
 
 import sqlite_vec
 
+from miniclaw.utils.jsonx import safe_loads_dict
+
 
 @dataclass(slots=True)
 class MemoryItem:
@@ -186,9 +188,7 @@ class SQLiteMemoryStore:
 
     @staticmethod
     def _row_to_item(row: tuple[Any, ...]) -> MemoryItem:
-        metadata = json.loads(row[3]) if row[3] else {}
-        if not isinstance(metadata, dict):
-            metadata = {}
+        metadata = safe_loads_dict(row[3]) if row[3] else {}
         return MemoryItem(
             thread_id=str(row[0]),
             content=str(row[1]),
