@@ -393,6 +393,7 @@ section.tree .toggle.empty { color: transparent; }
 section.tree .status-icon { width: 14px; text-align: center; font-size: 11px; }
 section.tree .status-ok { color: var(--ok); }
 section.tree .status-error { color: var(--error); }
+section.tree .status-fallback { color: #e6a817; }
 section.tree .status-running { color: var(--warn); }
 section.tree .span-name { font-family: "JetBrains Mono", monospace; font-size: 12px; white-space: nowrap; }
 section.tree .span-name.prefix-graph { color: var(--span-graph); }
@@ -426,6 +427,7 @@ aside.details .kv .k { color: var(--fg-muted); }
 aside.details .kv .v { color: var(--fg); word-break: break-word; }
 aside.details .kv .v.status-ok { color: var(--ok); }
 aside.details .kv .v.status-error { color: var(--error); }
+aside.details .kv .v.status-fallback { color: #e6a817; }
 aside.details .json { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-family: "JetBrains Mono", monospace; font-size: 11px; white-space: pre-wrap; word-break: break-word; color: var(--fg); max-height: 240px; overflow: auto; cursor: zoom-in; position: relative; transition: border-color 0.15s, box-shadow 0.15s; }
 aside.details .json:hover { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 aside.details .json:hover + .section-title .expand-hint,
@@ -633,9 +635,41 @@ function formatTokens(n) {
   return (n / 1000000).toFixed(2) + "M";
 }
 
+function memorySpanSummary(span) {
+  const o = span.output || {};
+  const m = span.metadata || {};
+  const name = span.name || "";
+  if (name === "memory.rewrite") {
+    const parts = [];
+    if (o.intent) parts.push(o.intent);
+    parts.push(o.used_llm ? "llm" : "fallback");
+    if (o.latency_ms) parts.push(o.latency_ms + "ms");
+    return parts;
+  }
+  if (name === "memory.retrieve") {
+    const parts = [];
+    if (o.assembly_mode) parts.push(o.assembly_mode);
+    if (o.memory_context_chars) parts.push(o.memory_context_chars + " chars");
+    return parts;
+  }
+  if (name === "memory.consolidate.llm") {
+    const parts = [];
+    if (o.facts_action_add) parts.push("+" + o.facts_action_add + " facts");
+    if (o.fallback_triggered) parts.push("fallback!");
+    return parts;
+  }
+  if (name.startsWith("bg.")) {
+    const parts = [name.replace("bg.", "")];
+    if (m.job_id) parts.push(m.job_id.slice(0, 12));
+    return parts;
+  }
+  return [];
+}
+
 function statusIcon(status) {
   if (status === "ok") return { text: "●", cls: "status-ok" };
   if (status === "error") return { text: "✗", cls: "status-error" };
+  if (status === "fallback") return { text: "◐", cls: "status-fallback" };
   return { text: "◌", cls: "status-running" };
 }
 
@@ -796,6 +830,7 @@ function renderSpanNode(span, trace) {
     }),
     el("span", { class: "status-icon " + icon.cls, text: icon.text }),
     el("span", { class: "span-name prefix-" + prefix, text: span.name }),
+    ...memorySpanSummary(span).map(s => el("span", { class: "span-tag dim", text: s })),
     ...tags.map(t => el("span", { class: t.cls, text: t.text })),
     el("span", { class: "span-duration", text: formatDuration(span.duration_ms) }),
   ]);
@@ -893,6 +928,7 @@ function renderDetails() {
     let cls = "v";
     if (k === "status" && v === "ok") cls += " status-ok";
     if (k === "status" && v === "error") cls += " status-error";
+    if (k === "status" && v === "fallback") cls += " status-fallback";
     kv.appendChild(el("div", { class: cls, text: String(v) }));
   }
   container.appendChild(kv);

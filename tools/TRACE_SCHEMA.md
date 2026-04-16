@@ -124,9 +124,51 @@ grouping. Keep them stable when adding new spans.
 
 | Name | Emitted by | Parent | Notes |
 |---|---|---|---|
-| `memory.retrieve` | `make_load_context` (future) | `graph.load_context` | Hybrid FTS5 + vec retrieval. Currently not opened by the runtime; reserved. |
+| `memory.rewrite` | `make_load_context` in nodes.py | `graph.load_context` | LLM query rewrite with intent classification. |
+| `memory.retrieve` | `make_load_context` in nodes.py | `graph.load_context` | Hybrid FTS5 + vec retrieval + adaptive assembly. |
+| `memory.consolidate.llm` | `_dispatch_consolidation` in service.py | `bg.memory.consolidate` | LLM-driven thread narrative + fact extraction. |
+| `memory.chunk.index` | *(reserved)* | indexer flush span | Parent-child chunk re-indexing after daily md update. |
+| `memory.critical.evict` | *(event, not span)* | `memory.consolidate.llm` | Critical pool LRU eviction when cap exceeded. |
 
-### 3.6 Events (kind=`event`)
+**`memory.rewrite` outputs:**
+- `used_llm` (bool): True if LLM was called; False on fallback
+- `intent` (string): `recall_prior | new_topic | direct_task | ambiguous`
+- `latency_ms` (int): Wall-clock time for the rewrite call
+- `failure_reason` (string): Empty on success; `no_provider`, `timeout`, `provider_error`, `missing_rewritten_query` on fallback
+- `keywords_count` (int): Number of extracted keywords
+
+**`memory.retrieve` outputs:**
+- `memory_context_chars` (int): Total characters of assembled context returned
+
+**`memory.consolidate.llm` outputs:**
+- `parsed_ok` (bool), `facts_action_add/update/skip` (int), `facts_tier_critical/normal` (int), `confidence` (float), `fallback_triggered` (bool)
+
+### 3.6 Background Jobs
+
+| Name | Emitted by | Parent | Notes |
+|---|---|---|---|
+| `bg.<kind>` | `BackgroundScheduler._execute` in background.py | Turn span (captured at submit time via `parent_trace`) | Fire-and-forget job execution. `<kind>` is the job's logical category. |
+
+Known `kind` values:
+- `memory.consolidate` — LLM memory consolidation (Phase 4)
+- *(future)* `subagent.judge` — subagent verification judge (from 2026-04-14 spec)
+- *(future)* `memory.rebuild` — background re-indexing
+
+**`bg.*` metadata:**
+- `job_id` (string): Stable ID for trace correlation
+- `queue_size_at_execute` (int): Backlog depth at execution start
+
+### 3.7 Status Values
+
+| Status | Meaning | Viewer color |
+|---|---|---|
+| `ok` | Completed successfully | Green |
+| `error` | Failed with exception | Red |
+| `fallback` | Degraded gracefully (LLM failed → regex path) | Yellow/orange |
+
+`fallback` is distinct from `error`: it means the system behaved as designed under a degraded condition. Used by `memory.rewrite` (LLM failed → raw user input), `memory.consolidate.llm` (LLM failed → regex fallback).
+
+### 3.8 Events (kind=`event`)
 
 | Name | Attached to | Payload |
 |---|---|---|
