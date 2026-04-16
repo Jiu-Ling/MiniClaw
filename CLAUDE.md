@@ -110,6 +110,13 @@ Pairing system: 6-digit random code → `miniclaw pair <code>` → authorized. C
 - **Immutable state**: RuntimeState flows through graph nodes; new state returned per step
 - **Protocol-based channels**: Declarative capability negotiation with automatic fallback
 - **HTML parse_mode**: Telegram uses HTML (not MarkdownV2) for reliability
+- **LangChain ecosystem first**: Prefer battle-tested LangChain/LangGraph components over hand-rolled equivalents. Specifically:
+  - **Structured output**: Use `ChatOpenAI.with_structured_output(PydanticModel)` for any LLM call that expects structured JSON — not prompt-level JSON instructions + manual parsing. This gives type-safe Pydantic validation and provider-native function-calling under the hood.
+  - **Text splitting**: Use `langchain-text-splitters` (`RecursiveCharacterTextSplitter`) — already adopted for parent-child chunking.
+  - **Prompt templates**: Use `langchain-core` `ChatPromptTemplate` when prompt complexity warrants it, but simple f-string templates are fine for short prompts.
+  - **Output parsers**: Use `PydanticOutputParser` / `JsonOutputParser` from `langchain-core` as fallback when `with_structured_output` is unavailable (e.g., non-OpenAI providers that don't support function calling).
+  - **Don't adopt**: `ParentDocumentRetriever` (our sqlite-vec + FTS5 + RRF fusion is already purpose-built); `ConversationSummaryMemory` (our thread-level consolidation has richer semantics); `EnsembleRetriever` (our 15-line RRF fuser is simpler). Reject if adaptation cost exceeds reimplementation cost.
+  - **Dependency discipline**: `langchain-core`, `langchain-text-splitters`, `langchain-openai` are OK. Do NOT pull in the full `langchain` meta-package or `langchain-community` (transitive deps are heavy and often conflict).
 
 ## Pending / Deferred Work
 

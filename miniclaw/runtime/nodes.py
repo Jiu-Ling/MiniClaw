@@ -279,8 +279,8 @@ def make_load_context(
             and user_input
         ):
             from miniclaw.memory.rewrite import RewriteInput, rewrite_query
-            provider = _select_rewrite_provider(settings, mini_provider, main_provider)
-            if provider is not None:
+            rw_provider = _select_rewrite_provider(settings, mini_provider, main_provider)
+            if rw_provider is not None:
                 recent = _extract_recent_exchanges(
                     state,
                     n=int(getattr(settings, "memory_rewrite_recent_exchanges", 2) or 2),
@@ -297,7 +297,7 @@ def make_load_context(
                     rewrite_result = _run_provider_sync(
                         rewrite_query(
                             rewrite_inputs,
-                            provider=provider,
+                            provider=rw_provider,
                             model=_resolve_rewrite_model(settings),
                             timeout_s=float(getattr(settings, "memory_rewrite_timeout_s", 1.0) or 1.0),
                         )
@@ -360,6 +360,7 @@ def _select_rewrite_provider(
     mini_provider: ChatProvider | None,
     main_provider: ChatProvider | None,
 ) -> ChatProvider | None:
+    """Select the provider for rewrite based on memory_rewrite_model_tier."""
     tier = str(getattr(settings, "memory_rewrite_model_tier", "auto") or "auto")
     if tier == "mini":
         return mini_provider
@@ -369,6 +370,7 @@ def _select_rewrite_provider(
 
 
 def _resolve_rewrite_model(settings: object) -> str:
+    """Resolve which model name to use for rewrite."""
     tier = str(getattr(settings, "memory_rewrite_model_tier", "auto") or "auto")
     if tier == "main":
         return str(getattr(settings, "model", "") or "")

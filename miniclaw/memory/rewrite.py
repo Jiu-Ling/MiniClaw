@@ -1,9 +1,8 @@
 """LLM-driven query rewrite for memory retrieval.
 
-Called from load_context before hitting the retriever. On any failure
-(no provider / timeout / bad JSON / missing required field) returns a
-RewriteResult flagged with used_llm=False so the caller can degrade to
-raw user input. Never raises, never blocks more than timeout_s seconds.
+Uses provider.achat_structured() for type-safe Pydantic responses via
+provider-native function calling. Falls back gracefully on any failure.
+Never raises, never blocks more than timeout_s seconds.
 """
 from __future__ import annotations
 
@@ -11,16 +10,23 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
-from miniclaw.providers.contracts import ChatMessage, ChatProvider
-from miniclaw.utils.jsonx import extract_json_object
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
 Intent = Literal["recall_prior", "new_topic", "direct_task", "ambiguous"]
 
-__all__ = ["RewriteInput", "RewriteResult", "rewrite_query"]
+__all__ = ["RewriteInput", "RewriteResult", "RewriteResponseSchema", "rewrite_query"]
+
+
+class RewriteResponseSchema(BaseModel):
+    """Pydantic schema for structured LLM output."""
+
+    rewritten_query: str = Field(description="Self-contained retrieval query, resolves pronouns, <100 chars")
+    keywords: list[str] = Field(default_factory=list, description="3-6 nouns/identifiers for keyword search")
+    intent: str = Field(default="ambiguous", description="recall_prior | new_topic | direct_task | ambiguous")
 
 
 @dataclass(frozen=True)
@@ -43,23 +49,42 @@ class RewriteResult:
 async def rewrite_query(
     inputs: RewriteInput,
     *,
-    provider: ChatProvider | None,
-    model: str,
+    provider: Any | None = None,
+    model: str = "",
     timeout_s: float = 1.0,
 ) -> RewriteResult:
-    """Rewrite user_input into a retrieval query with intent. Never raises."""
+    """Rewrite user_input into a retrieval query with intent. Never raises.
+
+    provider: a ChatProvider with achat_structured support.
+    """
     if provider is None:
         return _fallback(inputs, reason="no_provider")
     if not inputs.user_input.strip():
         return _fallback(inputs, reason="empty_input")
 
-    prompt = _build_prompt(inputs)
+    messages = _build_messages(inputs)
     start = time.monotonic()
     try:
-        response = await asyncio.wait_for(
-            provider.achat(prompt, model=model, tools=None),
-            timeout=timeout_s,
-        )
+        achat_structured = getattr(provider, "achat_structured", None)
+        if achat_structured is not None:
+            response = await asyncio.wait_for(
+                achat_structured(messages, schema=RewriteResponseSchema, model=model or None),
+                timeout=timeout_s,
+            )
+        else:
+            # Fallback for providers without achat_structured: use raw achat + parse
+            from miniclaw.utils.jsonx import extract_json_object
+            raw_response = await asyncio.wait_for(
+                provider.achat(messages, model=model or None, tools=None),
+                timeout=timeout_s,
+            )
+            raw_text = str(getattr(raw_response, "content", "") or "")
+            parsed = extract_json_object(raw_text, default={})
+            response = RewriteResponseSchema(
+                rewritten_query=str(parsed.get("rewritten_query", "")),
+                keywords=parsed.get("keywords", []) if isinstance(parsed.get("keywords"), list) else [],
+                intent=str(parsed.get("intent", "ambiguous")),
+            )
     except asyncio.TimeoutError:
         return _fallback(inputs, reason="timeout", latency_ms=_ms(start))
     except Exception as exc:
@@ -67,19 +92,12 @@ async def rewrite_query(
         return _fallback(inputs, reason=f"provider_error: {exc}", latency_ms=_ms(start))
 
     latency_ms = _ms(start)
-    raw = str(getattr(response, "content", "") or "")
-    parsed = extract_json_object(raw, default={})
-
-    rewritten = str(parsed.get("rewritten_query", "")).strip()
+    rewritten = (response.rewritten_query or "").strip()
     if not rewritten:
-        return _fallback(inputs, reason="missing_rewritten_query", latency_ms=latency_ms, raw=raw)
+        return _fallback(inputs, reason="missing_rewritten_query", latency_ms=latency_ms)
 
-    keywords_raw = parsed.get("keywords", [])
-    if not isinstance(keywords_raw, list):
-        keywords_raw = []
-    keywords = tuple(str(k).strip() for k in keywords_raw if str(k).strip())[:8]
-
-    intent_raw = str(parsed.get("intent", "ambiguous")).strip()
+    keywords = tuple(k.strip() for k in response.keywords if k.strip())[:8]
+    intent_raw = (response.intent or "ambiguous").strip()
     intent: Intent = (
         intent_raw
         if intent_raw in ("recall_prior", "new_topic", "direct_task", "ambiguous")
@@ -92,7 +110,7 @@ async def rewrite_query(
         intent=intent,
         used_llm=True,
         latency_ms=latency_ms,
-        raw_response=raw[:500],
+        raw_response=str(response)[:500],
     )
 
 
@@ -101,7 +119,6 @@ def _fallback(
     *,
     reason: str,
     latency_ms: int = 0,
-    raw: str = "",
 ) -> RewriteResult:
     return RewriteResult(
         rewritten_query=inputs.user_input[:200],
@@ -109,7 +126,6 @@ def _fallback(
         intent="ambiguous",
         used_llm=False,
         latency_ms=latency_ms,
-        raw_response=raw,
         failure_reason=reason,
     )
 
@@ -118,36 +134,34 @@ def _ms(start: float) -> int:
     return int((time.monotonic() - start) * 1000)
 
 
-_PROMPT_TEMPLATE = """You are a memory retrieval assistant. Given the user's latest message and a \
-tiny slice of recent conversation, produce a retrieval query and classify the intent. \
-Output ONLY a single JSON object, no prose, no code fences.
+_SYSTEM = (
+    "You are a memory retrieval assistant. "
+    "Classify the user's intent and rewrite their message into a self-contained retrieval query."
+)
 
+_USER_TEMPLATE = """\
 ## Recent conversation (last {n} exchanges, may be empty)
 {recent_exchanges}
 
 ## User's latest message
 {user_input}
 
-## Task
-1. intent ∈ {{recall_prior, new_topic, direct_task, ambiguous}}
-2. rewritten_query: self-contained, resolves pronouns, <100 chars
-3. keywords: 3-6 nouns/identifiers, no stopwords, no pronouns, mix zh/en
-
-## Output (strict JSON, no other text)
-{{"rewritten_query": "string", "keywords": ["kw"], "intent": "new_topic"}}
-"""
+Determine intent (recall_prior / new_topic / direct_task / ambiguous), \
+rewrite the query resolving pronouns, and extract 3-6 search keywords."""
 
 
-def _build_prompt(inputs: RewriteInput) -> list[ChatMessage]:
+def _build_messages(inputs: RewriteInput) -> list[dict[str, str]]:
     exchanges_text = _format_exchanges(inputs.recent_exchanges)
-    user_content = _PROMPT_TEMPLATE.format(
-        n=len(inputs.recent_exchanges),
-        recent_exchanges=exchanges_text or "(no prior exchanges)",
-        user_input=inputs.user_input.strip()[:500],
-    )
     return [
-        ChatMessage(role="system", content="You output strict JSON. No prose. No code fences."),
-        ChatMessage(role="user", content=user_content),
+        {"role": "system", "content": _SYSTEM},
+        {
+            "role": "user",
+            "content": _USER_TEMPLATE.format(
+                n=len(inputs.recent_exchanges),
+                recent_exchanges=exchanges_text or "(no prior exchanges)",
+                user_input=inputs.user_input.strip()[:500],
+            ),
+        },
     ]
 
 

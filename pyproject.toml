@@ -5,6 +5,7 @@ description = "Minimal recoverable runtime package for MiniClaw"
 requires-python = ">=3.11"
 dependencies = [
     "langchain-core>=1.0,<2.0",
+    "langchain-openai>=0.3,<1.0",
     "langchain-text-splitters>=0.3,<0.4",
     "langgraph>=1.0,<2.0",
     "openai>=1.68.2,<2.0.0",

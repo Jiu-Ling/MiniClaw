@@ -179,6 +179,36 @@ class OpenAICompatibleProvider(ChatProvider):
             raw=response_data,
         )
 
+    async def achat_structured(
+        self,
+        messages: Sequence[Any],
+        *,
+        schema: type,
+        model: str | None = None,
+    ) -> Any:
+        """Return a Pydantic model instance using langchain-openai's with_structured_output.
+
+        Constructs a ChatOpenAI with this provider's credentials, applies
+        with_structured_output(schema), and invokes with the given messages.
+        The schema should be a Pydantic BaseModel subclass.
+        """
+        from langchain_openai import ChatOpenAI
+
+        llm = ChatOpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            model=model or self.model,
+        )
+        structured = llm.with_structured_output(schema)
+        # Normalize messages to dicts if they're ChatMessage objects
+        normalized = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                normalized.append(msg)
+            else:
+                normalized.append({"role": getattr(msg, "role", "user"), "content": getattr(msg, "content", "")})
+        return await structured.ainvoke(normalized)
+
     async def astream_text(
         self,
         messages: Sequence[ChatMessage],

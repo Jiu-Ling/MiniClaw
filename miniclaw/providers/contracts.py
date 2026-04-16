@@ -81,6 +81,21 @@ class ChatProvider(Protocol):
         tools: Sequence[dict[str, Any]] | None = None,
     ) -> ChatResponse: ...
 
+    async def achat_structured(
+        self,
+        messages: Sequence[Any],
+        *,
+        schema: type,
+        model: str | None = None,
+    ) -> Any:
+        """Return a Pydantic model instance parsed from the LLM response.
+
+        Uses provider-native structured output (e.g., function calling) when
+        available. Implementations may use langchain-openai's
+        with_structured_output under the hood.
+        """
+        ...
+
     async def astream_text(
         self,
         messages: Sequence[ChatMessage],
