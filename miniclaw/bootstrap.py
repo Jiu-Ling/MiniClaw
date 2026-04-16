@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from miniclaw.config.settings import Settings, _default_sqlite_path
 from miniclaw.cron.service import CronService
@@ -15,6 +15,7 @@ from miniclaw.memory.retriever import HybridRetriever
 from miniclaw.mcp.registry import MCPRegistry
 from miniclaw.observability.factory import build_tracer
 from miniclaw.persistence.factory import build_memory_store
+from miniclaw.persistence.memory_store import MemoryStore
 from miniclaw.prompting import ContextBuilder
 from miniclaw.providers.openai_compat import OpenAICompatibleProvider
 from miniclaw.runtime.checkpoint import AsyncSQLiteCheckpointer
@@ -42,6 +43,11 @@ from miniclaw.tools.search import SearchBackend, build_search_backend
 from miniclaw.tools.registry import RegisteredTool
 from miniclaw.tools.registry import ToolRegistry
 from miniclaw.observability.contracts import TraceContext
+
+if TYPE_CHECKING:
+    from miniclaw.cron.types import CronJob
+    from miniclaw.observability.contracts import Tracer
+    from miniclaw.runtime.background import BackgroundScheduler
 
 
 
@@ -166,11 +172,11 @@ def build_cron_service(
 def build_heartbeat_service(
     settings: Settings | None = None,
     *,
-    provider: object | None = None,
+    provider: OpenAICompatibleProvider | None = None,
     on_execute: Any | None = None,
     on_notify: Any | None = None,
     runtime_factory: Callable[[], RuntimeService] | None = None,
-    mini_provider: object | None = None,
+    mini_provider: OpenAICompatibleProvider | None = None,
 ) -> HeartbeatService:
     resolved_settings = settings or build_settings()
     resolved_provider = provider or build_provider(resolved_settings)
@@ -269,9 +275,9 @@ def build_retriever(settings: Settings, embedder: OllamaEmbedder) -> HybridRetri
 def build_runtime_service(
     settings: Settings | None = None,
     *,
-    provider: Any | None = None,
-    mini_provider: object | None = None,
-    memory_store: Any | None = None,
+    provider: OpenAICompatibleProvider | None = None,
+    mini_provider: OpenAICompatibleProvider | None = None,
+    memory_store: MemoryStore | None = None,
     memory_file_store: MemoryFileStore | None = None,
     tool_registry: ToolRegistry | None = None,
     mcp_registry: MCPRegistry | None = None,
@@ -279,11 +285,11 @@ def build_runtime_service(
     search_backend: SearchBackend | None = None,
     messaging_bridge: MessagingBridge | None = None,
     thread_control_store: SQLiteThreadControlStore | None = None,
-    tracer: Any | None = None,
+    tracer: TraceContext | None = None,
     langsmith_client: Any | None = None,
-    memory_indexer: object | None = None,
-    retriever: object | None = None,
-    background_scheduler: object | None = None,
+    memory_indexer: MemoryIndexer | None = None,
+    retriever: HybridRetriever | None = None,
+    background_scheduler: BackgroundScheduler | None = None,
 ) -> RuntimeService:
     resolved_settings = settings or build_settings()
     resolved_memory_store = memory_store or build_memory_store(resolved_settings.sqlite_path)
@@ -419,11 +425,11 @@ def _build_scheduled_runtime_callback(
 ):
     build_runtime = _make_runtime_builder(settings, runtime_factory)
 
-    async def _run(job) -> str | None:
+    async def _run(job: CronJob) -> str | None:
         runtime = build_runtime()
-        payload = getattr(job, "payload", None)
-        raw_message = str(getattr(payload, "message", "")).strip()
-        job_name = str(getattr(job, "name", "")).strip()
+        payload = job.payload
+        raw_message = (payload.message or "").strip()
+        job_name = job.name.strip()
 
         # Build a task directive instead of passing raw prompt
         user_input = (
@@ -432,9 +438,9 @@ def _build_scheduled_runtime_callback(
             f"Task: {raw_message}"
         )
 
-        channel = str(getattr(payload, "channel", "") or "").strip()
-        chat_id = str(getattr(payload, "chat_id", "") or "").strip()
-        message_thread_id = str(getattr(payload, "message_thread_id", "") or "").strip()
+        channel = (payload.channel or "").strip()
+        chat_id = (payload.chat_id or "").strip()
+        message_thread_id = (payload.message_thread_id or "").strip()
         runtime_metadata: dict[str, Any] = {
             "thread_id": f"cron:{job.id}",
             "channel": channel or "cron",
