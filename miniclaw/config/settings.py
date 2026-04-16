@@ -116,6 +116,13 @@ class Settings(BaseSettings):
     memory_rewrite_timeout_s: float = 1.0
     memory_rewrite_recent_exchanges: int = 2
 
+    # Memory consolidation (Phase 4)
+    memory_consolidation_enabled: bool = False
+    memory_consolidation_model_tier: Literal["mini", "main", "auto"] = "auto"
+    memory_consolidation_timeout_s: float = 30.0
+    memory_consolidation_trigger_threshold: int = 3
+    memory_critical_facts_max: int = 12
+
     # Prompt caching (DashScope cache_control: ephemeral)
     enable_prompt_cache: bool = False
 
