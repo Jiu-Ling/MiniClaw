@@ -11,18 +11,25 @@ class OllamaEmbedder:
         self._timeout = httpx.Timeout(connect=5.0, read=120.0, write=5.0, pool=5.0)
         self._transport = _transport  # For testing only
 
-    async def embed(self, texts: list[str]) -> list[list[float]]:
+    async def embed(self, texts: list[str], *, batch_size: int = 16) -> list[list[float]]:
+        """Embed texts in batches to avoid Ollama timeout on large inputs."""
+        if not texts:
+            return []
+        all_embeddings: list[list[float]] = []
         kwargs: dict = {"base_url": self.base_url, "timeout": self._timeout}
         if self._transport is not None:
             kwargs["transport"] = self._transport
         async with httpx.AsyncClient(**kwargs) as client:
-            response = await client.post(
-                "/api/embed",
-                json={"model": self.model, "input": texts},
-            )
-        response.raise_for_status()
-        data = response.json()
-        return data["embeddings"]
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i : i + batch_size]
+                response = await client.post(
+                    "/api/embed",
+                    json={"model": self.model, "input": batch},
+                )
+                response.raise_for_status()
+                data = response.json()
+                all_embeddings.extend(data["embeddings"])
+        return all_embeddings
 
     async def embed_one(self, text: str) -> list[float]:
         vectors = await self.embed([text])

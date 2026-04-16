@@ -88,10 +88,12 @@ def memory_rebuild(
         raise typer.Exit(code=1)
 
     typer.echo("Rebuilding index (this may take a minute for embedding)...")
+    typer.echo("NOTE: Requires Ollama running at the configured ollama_base_url.")
     try:
         asyncio.run(indexer.rebuild_all())
     except Exception as exc:
-        typer.echo(f"Rebuild failed: {exc}", err=True)
+        error_msg = str(exc) or f"{type(exc).__name__} (no message)"
+        typer.echo(f"Rebuild failed: {error_msg}", err=True)
         raise typer.Exit(code=1)
 
     # Count results
