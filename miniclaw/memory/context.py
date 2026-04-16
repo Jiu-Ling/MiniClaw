@@ -7,6 +7,7 @@ from miniclaw.persistence.memory_store import MemoryStore
 from miniclaw.utils.async_bridge import run_sync as _run_sync
 
 if TYPE_CHECKING:
+    from miniclaw.memory.retriever import HybridRetriever
     from miniclaw.memory.rewrite import RewriteResult
 
 MEMORY_SECTION_TITLE = "Memory"
@@ -22,7 +23,7 @@ def build_memory_context(
     thread_id: str,
     *,
     memory_file: MemoryFileStore | None = None,
-    retriever: object | None = None,
+    retriever: HybridRetriever | None = None,
     user_input: str = "",
     memory_token_budget: int = 2000,
     rewrite: "RewriteResult | None" = None,
@@ -51,24 +52,20 @@ def build_memory_context(
             query = rewrite.rewritten_query if rewrite is not None else user_input
             keywords = rewrite.keywords if rewrite is not None else ()
             top_k = 3 if intent == "direct_task" else 5
-            search = getattr(retriever, "search", None)
-            if callable(search):
-                chunks = _run_sync(search(query, top_k=top_k, keywords=keywords))
-                if chunks:
-                    from miniclaw.memory.retriever import assemble_adaptive
-                    parent_loader = getattr(retriever, "load_parent", None)
-                    neighbor_loader = getattr(retriever, "load_neighbors", None)
-                    if callable(parent_loader) and callable(neighbor_loader):
-                        assembled = assemble_adaptive(
-                            chunks,
-                            budget_chars=char_budget,
-                            parent_loader=parent_loader,
-                            neighbor_loader=lambda ch: neighbor_loader(ch, radius=1),
-                        )
-                    else:
-                        assembled = [c.content for c in chunks]
-                    if assembled:
-                        sections.append("\n".join(["## Related Context", *assembled]))
+            chunks = _run_sync(retriever.search(query, top_k=top_k, keywords=keywords))
+            if chunks:
+                from miniclaw.memory.retriever import assemble_adaptive
+                if hasattr(retriever, "load_parent") and hasattr(retriever, "load_neighbors"):
+                    assembled = assemble_adaptive(
+                        chunks,
+                        budget_chars=char_budget,
+                        parent_loader=retriever.load_parent,
+                        neighbor_loader=lambda ch: retriever.load_neighbors(ch, radius=1),
+                    )
+                else:
+                    assembled = [c.content for c in chunks]
+                if assembled:
+                    sections.append("\n".join(["## Related Context", *assembled]))
 
     return "\n\n".join(sections)
 

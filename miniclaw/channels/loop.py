@@ -140,9 +140,9 @@ class MessageLoop:
     def _resolve_workspace_root(self) -> Path:
         """Best-effort workspace root lookup. Uses runtime.settings.runtime_dir
         if available; otherwise walks up from cwd looking for pyproject.toml."""
-        settings = getattr(self.runtime, "settings", None)
+        settings = self.runtime.settings
         if settings is not None:
-            runtime_dir = getattr(settings, "runtime_dir", None)
+            runtime_dir = settings.runtime_dir
             if runtime_dir is not None:
                 return Path(runtime_dir)
         cwd = Path.cwd()
@@ -161,7 +161,7 @@ class MessageLoop:
         if content_parts:
             kwargs["user_content_parts"] = content_parts
         result = self.runtime.run_turn(**kwargs)
-        text = getattr(result, "response_text", "") or getattr(result, "last_error", "") or ""
+        text = result.response_text or result.last_error or ""
         await self._send_formatted(inbound.channel_id, text, reply_to=inbound.message_id)
 
     async def _run_streaming(self, inbound, user_input, content_parts, runtime_metadata):
@@ -241,15 +241,15 @@ class MessageLoop:
             user_input=user_input,
             runtime_metadata=runtime_metadata,
         ):
-            kind = str(getattr(event, "kind", ""))
-            metadata = getattr(event, "metadata", None) or {}
+            kind = event.kind
+            metadata = event.metadata or {}
 
             if kind == "thinking":
-                await _update(str(getattr(event, "text", "🤔 MiniClaw is thinking...")))
+                await _update(event.text or "🤔 MiniClaw is thinking...")
 
             elif kind == "model_text":
                 # Model's intermediate response — show with tool history
-                model_text = str(getattr(event, "text", ""))
+                model_text = event.text
                 await _update(_build_display(
                     tool_section=_tool_history_section(),
                     body=model_text,
@@ -283,17 +283,17 @@ class MessageLoop:
 
             elif kind == "chunk":
                 # Final response text
-                final_text = str(getattr(event, "text", ""))
+                final_text = event.text
                 await _update(_build_display(
                     tool_section=_tool_history_section(),
                     body=final_text,
                 ))
 
             elif kind == "result":
-                result = getattr(event, "result", None)
+                result = event.result
                 final = ""
                 if result:
-                    final = str(getattr(result, "response_text", "")) or str(getattr(result, "last_error", ""))
+                    final = result.response_text or result.last_error
                 display = _build_display(
                     tool_section=_tool_history_section(),
                     body=final,

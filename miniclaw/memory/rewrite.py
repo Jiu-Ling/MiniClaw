@@ -10,7 +10,10 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from miniclaw.providers.contracts import ChatProvider
 
 from pydantic import BaseModel, Field
 
@@ -49,7 +52,7 @@ class RewriteResult:
 async def rewrite_query(
     inputs: RewriteInput,
     *,
-    provider: Any | None = None,
+    provider: ChatProvider | None = None,
     model: str = "",
     timeout_s: float = 1.0,
 ) -> RewriteResult:
@@ -78,7 +81,7 @@ async def rewrite_query(
                 provider.achat(messages, model=model or None, tools=None),
                 timeout=timeout_s,
             )
-            raw_text = str(getattr(raw_response, "content", "") or "")
+            raw_text = str(raw_response.content or "")
             parsed = extract_json_object(raw_text, default={})
             response = RewriteResponseSchema(
                 rewritten_query=str(parsed.get("rewritten_query", "")),

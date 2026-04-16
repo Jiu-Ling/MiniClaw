@@ -6,10 +6,14 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from miniclaw.memory.files import MemoryFileStore
 from miniclaw.providers.contracts import ChatMessage
+
+if TYPE_CHECKING:
+    from miniclaw.memory.indexer import MemoryIndexer
+    from miniclaw.providers.contracts import ChatProvider
 from miniclaw.utils.jsonx import extract_json_object
 
 logger = logging.getLogger(__name__)
@@ -38,15 +42,15 @@ class ConsolidationResult:
 
 
 async def llm_consolidate(
-    *, thread_id: str, provider: Any, model: str, memory_path: Path,
+    *, thread_id: str, provider: ChatProvider, model: str, memory_path: Path,
     digests: list[str], recent_exchanges: list[tuple[str, str]],
-    daily_dir: Path | None = None, indexer: Any | None = None, critical_max: int = 12,
+    daily_dir: Path | None = None, indexer: MemoryIndexer | None = None, critical_max: int = 12,
 ) -> ConsolidationResult:
     """Run LLM consolidation. RAISES on any failure."""
     crit, norm, recent = _read_memory(memory_path)
     msgs = _build_prompt(crit, norm, digests, recent_exchanges)
     resp = await asyncio.wait_for(provider.achat(msgs, model=model, tools=None), timeout=30.0)
-    raw = str(getattr(resp, "content", "") or "")
+    raw = str(resp.content or "")
     parsed = extract_json_object(raw, default=None)
     if not parsed or "thread_narrative" not in parsed:
         raise ValueError(f"invalid consolidation JSON: {raw[:200]}")
@@ -166,7 +170,7 @@ def _write_memory(
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _write_daily(daily_dir: Path, thread_id: str, narrative: str, indexer: Any | None) -> None:
+def _write_daily(daily_dir: Path, thread_id: str, narrative: str, indexer: MemoryIndexer | None) -> None:
     daily_dir.mkdir(parents=True, exist_ok=True)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     path = daily_dir / f"{today}.md"

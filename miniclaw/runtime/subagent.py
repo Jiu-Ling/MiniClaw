@@ -146,7 +146,7 @@ async def run_subagent(
     rounds_used = 0
     consecutive_errors = 0
     final_usage: dict[str, Any] = {}
-    max_result_chars = int(getattr(settings, "subagent_max_tool_result_chars", 2_000) or 2_000)
+    max_result_chars = settings.subagent_max_tool_result_chars
 
     try:
         for round_idx in range(settings.max_tool_rounds):
@@ -258,13 +258,13 @@ async def run_subagent(
             _MAX_ASSISTANT_CHARS = 4000
             for idx_msg in range(len(messages)):
                 msg = messages[idx_msg]
-                if getattr(msg, "role", "") == "assistant":
-                    content = getattr(msg, "content", "") or ""
+                if msg.role == "assistant":
+                    content = msg.content or ""
                     if len(content) > _MAX_ASSISTANT_CHARS:
                         messages[idx_msg] = ChatMessage(
                             role="assistant",
                             content=content[:_MAX_ASSISTANT_CHARS] + "\n...[response truncated]",
-                            tool_calls=getattr(msg, "tool_calls", None),
+                            tool_calls=msg.tool_calls,
                         )
 
             safe_finish_span(

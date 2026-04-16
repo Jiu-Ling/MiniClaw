@@ -29,22 +29,17 @@ def trace_messages(messages: list[ChatMessage] | None) -> list[dict[str, Any]]:
     tail = messages[-TRACE_MESSAGE_LIMIT:]
     out: list[dict[str, Any]] = []
     for m in tail:
-        item: dict[str, Any] = {"role": getattr(m, "role", "") or ""}
-        content = getattr(m, "content", None)
-        if isinstance(content, str) and content:
-            item["content"] = content
-        parts = getattr(m, "content_parts", None)
-        if parts:
-            item["content_parts_count"] = len(parts)
-        tool_calls = getattr(m, "tool_calls", None)
-        if tool_calls:
-            item["tool_call_count"] = len(tool_calls)
-        tcid = getattr(m, "tool_call_id", None)
-        if tcid:
-            item["tool_call_id"] = tcid
-        name = getattr(m, "name", None)
-        if name:
-            item["name"] = name
+        item: dict[str, Any] = {"role": m.role or ""}
+        if isinstance(m.content, str) and m.content:
+            item["content"] = m.content
+        if m.content_parts:
+            item["content_parts_count"] = len(m.content_parts)
+        if m.tool_calls:
+            item["tool_call_count"] = len(m.tool_calls)
+        if m.tool_call_id:
+            item["tool_call_id"] = m.tool_call_id
+        if m.name:
+            item["name"] = m.name
         out.append(item)
     return out
 
@@ -311,17 +306,17 @@ def _exec_one_with_span(
     result = _exec_one(tool_registry, tool_call, active_capabilities)
 
     if span is not None:
-        content = getattr(result, "content", "") or ""
+        content = result.content or ""
         if len(content) > max_result_chars:
-            content = content[:max_result_chars] + f"\n[truncated {len(getattr(result, 'content', '')) - max_result_chars} chars]"
+            content = content[:max_result_chars] + f"\n[truncated {len(result.content) - max_result_chars} chars]"
         try:
             tracer.finish_span(
                 span,
-                status="error" if getattr(result, "is_error", False) else "ok",
+                status="error" if result.is_error else "ok",
                 outputs={
                     "content": content,
-                    "is_error": bool(getattr(result, "is_error", False)),
-                    "metadata": _safe_copy_for_trace(getattr(result, "metadata", {}) or {}),
+                    "is_error": result.is_error,
+                    "metadata": _safe_copy_for_trace(result.metadata or {}),
                 },
             )
         except Exception:
