@@ -4,6 +4,7 @@ from collections.abc import Iterator, Mapping
 import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from langgraph.checkpoint.base import Checkpoint
@@ -28,8 +29,13 @@ if TYPE_CHECKING:
     from miniclaw.config.settings import Settings
     from miniclaw.memory.indexer import MemoryIndexer
     from miniclaw.memory.retriever import HybridRetriever
+    from miniclaw.observability.contracts import Tracer
     from miniclaw.providers.contracts import ChatProvider, ChatResponse
+    from miniclaw.providers.openai_compat import OpenAICompatibleProvider
+    from miniclaw.runtime.background import BackgroundScheduler
+    from miniclaw.runtime.thread_control import SQLiteThreadControlStore
     from miniclaw.tools.contracts import ToolCall, ToolResult
+    from miniclaw.tools.messaging import MessagingBridge
     from miniclaw.tools.registry import ToolRegistry
 
 THREAD_SUMMARY_KIND = "thread_summary"
@@ -75,13 +81,13 @@ class RuntimeService:
         memory_store: MemoryStore,
         memory_file_store: MemoryFileStore | None = None,
         tool_registry: ToolRegistry | None = None,
-        thread_control_store: object | None = None,
+        thread_control_store: SQLiteThreadControlStore | None = None,
         memory_indexer: MemoryIndexer | None = None,
         retriever: HybridRetriever | None = None,
         mini_provider: OpenAICompatibleProvider | None = None,
         tracer: TraceContext | None = None,
-        clock: object | None = None,
-        background_scheduler: object | None = None,
+        clock: Callable[[], datetime] | None = None,
+        background_scheduler: BackgroundScheduler | None = None,
     ) -> None:
         self.settings = settings
         self.provider = provider
@@ -109,7 +115,7 @@ class RuntimeService:
         graph.add_edge("persist", END)
         return graph.compile(checkpointer=self._checkpointer)
 
-    def with_messaging_bridge(self, bridge: object) -> "RuntimeService":
+    def with_messaging_bridge(self, bridge: MessagingBridge) -> "RuntimeService":
         bound = copy.copy(self)
         tool_registry = self.tool_registry
         if tool_registry is None:
@@ -592,7 +598,7 @@ class RuntimeService:
 
         memory_path = self.settings.runtime_dir / "MEMORY.md"
         daily_dir = self.settings.runtime_dir / "memory"
-        threshold = int(getattr(self.settings, "memory_consolidation_trigger_threshold", 3) or 3)
+        threshold = self.settings.memory_consolidation_trigger_threshold
         digests = [
             item.content for item in
             self.memory_store.list_recent_by_kind(thread_id, THREAD_SUMMARY_KIND, threshold)
@@ -608,7 +614,7 @@ class RuntimeService:
                 memory_path=memory_path, digests=digests,
                 recent_exchanges=[], daily_dir=daily_dir,
                 indexer=self.memory_indexer,
-                critical_max=int(getattr(self.settings, "memory_critical_facts_max", 12) or 12),
+                critical_max=self.settings.memory_critical_facts_max,
             ))
 
         def _fallback(exc):
@@ -626,14 +632,14 @@ class RuntimeService:
         self._dispatch_background(job)
 
     def _should_trigger_consolidation(self, thread_id: str) -> bool:
-        if not getattr(self.settings, "memory_consolidation_enabled", False):
+        if not self.settings.memory_consolidation_enabled:
             return False
-        threshold = int(getattr(self.settings, "memory_consolidation_trigger_threshold", 3) or 3)
+        threshold = self.settings.memory_consolidation_trigger_threshold
         summaries = self.memory_store.list_recent_by_kind(thread_id, THREAD_SUMMARY_KIND, threshold)
         return len(summaries) >= threshold
 
     def _select_consolidation_provider(self):
-        tier = str(getattr(self.settings, "memory_consolidation_model_tier", "auto") or "auto")
+        tier = self.settings.memory_consolidation_model_tier
         if tier == "mini":
             return self.mini_provider
         if tier == "main":
@@ -641,11 +647,11 @@ class RuntimeService:
         return self.mini_provider or self.provider
 
     def _resolve_consolidation_model(self) -> str:
-        tier = str(getattr(self.settings, "memory_consolidation_model_tier", "auto") or "auto")
+        tier = self.settings.memory_consolidation_model_tier
         if tier == "main":
-            return str(getattr(self.settings, "model", "") or "")
-        mini = getattr(self.settings, "mini_model", None)
-        return str(mini) if mini else str(getattr(self.settings, "model", "") or "")
+            return self.settings.model
+        mini = self.settings.mini_model
+        return mini if mini else self.settings.model
 
     def _list_recent_by_kind(self, thread_id: str, kind: str, *, limit: int) -> list[MemoryItem]:
         return self.memory_store.list_recent_by_kind(thread_id, kind, limit)
@@ -689,12 +695,12 @@ class RuntimeService:
                 import logging
                 logging.getLogger(__name__).exception(
                     "scheduler.submit failed; falling back to sync for kind=%s",
-                    getattr(job, "kind", "unknown"),
+                    job.kind,
                 )
         try:
             job.fn()
         except Exception as exc:
-            if getattr(job, "on_failure", None) is not None:
+            if job.on_failure is not None:
                 try:
                     job.on_failure(exc)
                 except Exception:
@@ -709,11 +715,11 @@ def _utc_now() -> datetime:
 
 
 def _wrap_tool_registry(
-    tool_registry: object | None,
+    tool_registry: ToolRegistry | None,
     *,
-    tracer: object,
+    tracer: Tracer,
     parent_context: TraceContext,
-) -> object | None:
+) -> _TracingToolRegistryProxy | None:
     if tool_registry is None:
         return None
     return _TracingToolRegistryProxy(
@@ -724,7 +730,7 @@ def _wrap_tool_registry(
 
 
 class _TracingProviderProxy:
-    def __init__(self, *, provider: ChatProvider, tracer: object, parent_context: TraceContext) -> None:
+    def __init__(self, *, provider: ChatProvider, tracer: Tracer, parent_context: TraceContext) -> None:
         self._provider = provider
         self._tracer = tracer
         self._parent_context = parent_context
@@ -791,7 +797,7 @@ class _TracingProviderProxy:
 
 
 class _TracingToolRegistryProxy:
-    def __init__(self, *, tool_registry: ToolRegistry, tracer: object, parent_context: TraceContext) -> None:
+    def __init__(self, *, tool_registry: ToolRegistry, tracer: Tracer, parent_context: TraceContext) -> None:
         self._tool_registry = tool_registry
         self._tracer = tracer
         self._parent_context = parent_context
@@ -866,7 +872,7 @@ def _normalize_mapping(value: object) -> dict[str, Any]:
     return {}
 
 
-def _build_langchain_callbacks(tracer: object) -> list[Any]:
+def _build_langchain_callbacks(tracer: Tracer) -> list[Any]:
     """Build LangChain callbacks for LangGraph node-level tracing.
 
     When a LangSmithTracer is active, injects a LangChainTracer that records
