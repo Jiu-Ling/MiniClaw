@@ -6,6 +6,7 @@ import uuid
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from miniclaw.observability.safe import safe_finish_span, safe_start_span
 from miniclaw.utils.async_bridge import run_sync as _run_provider_sync
 from miniclaw.utils.jsonx import safe_loads_with_raw
 
@@ -288,7 +289,7 @@ def make_load_context(
                     user_input=user_input,
                     recent_exchanges=recent,
                 )
-                rewrite_span = _safe_start_span(
+                rewrite_span = safe_start_span(
                     tracer, parent_trace, name="memory.rewrite",
                     metadata={"model_tier": str(getattr(settings, "memory_rewrite_model_tier", "auto"))},
                 )
@@ -303,7 +304,7 @@ def make_load_context(
                     )
                 except Exception:
                     rewrite_result = None
-                _safe_finish_span(
+                safe_finish_span(
                     tracer, rewrite_span,
                     status="ok" if (rewrite_result and rewrite_result.used_llm) else "fallback",
                     outputs=(
@@ -321,7 +322,7 @@ def make_load_context(
 
         memory_context = ""
         if thread_id:
-            retrieve_span = _safe_start_span(
+            retrieve_span = safe_start_span(
                 tracer, parent_trace, name="memory.retrieve",
                 metadata={
                     "thread_id": thread_id,
@@ -336,7 +337,7 @@ def make_load_context(
                 memory_token_budget=memory_token_budget,
                 rewrite=rewrite_result,
             )
-            _safe_finish_span(
+            safe_finish_span(
                 tracer, retrieve_span,
                 status="ok",
                 outputs={"memory_context_chars": len(memory_context)},
@@ -375,36 +376,6 @@ def _resolve_rewrite_model(settings: object) -> str:
     if mini:
         return str(mini)
     return str(getattr(settings, "model", "") or "")
-
-
-def _safe_start_span(
-    tracer: object | None,
-    parent: Any,
-    *,
-    name: str,
-    metadata: dict[str, Any] | None = None,
-) -> Any:
-    if tracer is None or parent is None:
-        return None
-    try:
-        return tracer.start_span(parent, name=name, metadata=metadata)
-    except Exception:
-        return None
-
-
-def _safe_finish_span(
-    tracer: object | None,
-    span: Any,
-    *,
-    status: str,
-    outputs: dict[str, Any] | None = None,
-) -> None:
-    if tracer is None or span is None:
-        return
-    try:
-        tracer.finish_span(span, status=status, outputs=outputs)
-    except Exception:
-        pass
 
 
 def _extract_recent_exchanges(
@@ -482,30 +453,6 @@ def make_agent(
         if on_event is not None:
             on_event({"kind": kind, **kwargs})
 
-    def _safe_start_span(
-        parent: Any,
-        *,
-        name: str,
-        metadata: dict[str, Any] | None = None,
-        inputs: dict[str, Any] | None = None,
-    ) -> Any:
-        try:
-            return resolved_tracer.start_span(parent, name=name, metadata=metadata, inputs=inputs)
-        except Exception:
-            return parent  # fall back to parent context so finish calls have something
-
-    def _safe_finish_span(
-        ctx: Any,
-        *,
-        status: str,
-        metadata: dict[str, Any] | None = None,
-        outputs: dict[str, Any] | None = None,
-    ) -> None:
-        try:
-            resolved_tracer.finish_span(ctx, status=status, metadata=metadata, outputs=outputs)
-        except Exception:
-            pass
-
     def agent(state: RuntimeState) -> RuntimeState:
         loop_state = dict(state)
         loop_state["active_capabilities"] = coerce_active_capabilities(state.get("active_capabilities"))
@@ -529,11 +476,12 @@ def make_agent(
                     messages = context_builder.build_provider_messages(loop_state)
                     visible_tools = _build_provider_tools(tool_registry, loop_state["active_capabilities"])
                 except Exception:
-                    _safe_start_span(parent_trace, name=f"agent.tool_loop.round_{round_idx}")
+                    safe_start_span(resolved_tracer, parent_trace, name=f"agent.tool_loop.round_{round_idx}")
                     # finish immediately — parent chain stays balanced
                     raise
 
-                round_span = _safe_start_span(
+                round_span = safe_start_span(
+                    resolved_tracer,
                     parent_trace,
                     name=f"agent.tool_loop.round_{round_idx}",
                     inputs={
@@ -545,7 +493,8 @@ def make_agent(
                 round_status = "ok"
                 round_outputs: dict[str, Any] = {}
                 try:
-                    chat_span = _safe_start_span(
+                    chat_span = safe_start_span(
+                        resolved_tracer,
                         round_span,
                         name="provider.achat",
                         metadata={"provider.model": settings.model},
@@ -564,10 +513,11 @@ def make_agent(
                             )
                         )
                     except Exception:
-                        _safe_finish_span(chat_span, status="error")
+                        safe_finish_span(resolved_tracer, chat_span, status="error")
                         round_status = "error"
                         raise
-                    _safe_finish_span(
+                    safe_finish_span(
+                        resolved_tracer,
                         chat_span,
                         status="ok",
                         metadata={"provider.usage": dict(getattr(response, "usage", {}) or {})},
@@ -654,7 +604,7 @@ def make_agent(
                     round_status = "error"
                     raise
                 finally:
-                    _safe_finish_span(round_span, status=round_status, outputs=round_outputs)
+                    safe_finish_span(resolved_tracer, round_span, status=round_status, outputs=round_outputs)
         except Exception as exc:
             return _error_state(loop_state, format_error(exc), usage)
 

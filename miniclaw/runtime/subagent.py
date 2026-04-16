@@ -4,6 +4,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
+from miniclaw.observability.safe import safe_finish_span, safe_record_event, safe_start_span
 from miniclaw.runtime.tool_loop import (
     trace_messages,
     trace_tool_calls,
@@ -15,15 +16,6 @@ if TYPE_CHECKING:
     from miniclaw.observability.contracts import TraceContext, Tracer
     from miniclaw.providers.contracts import ChatProvider
     from miniclaw.tools.registry import ToolRegistry
-
-
-def _safe_tracer_call(fn: Callable[..., Any], *args: Any, fallback: Any = None, **kwargs: Any) -> Any:
-    """Invoke a tracer method, swallowing exceptions so a broken tracer never
-    propagates into the subagent loop. Returns `fallback` on failure."""
-    try:
-        return fn(*args, **kwargs)
-    except Exception:
-        return fallback
 
 
 @dataclass(frozen=True)
@@ -159,8 +151,8 @@ async def run_subagent(
     try:
         for round_idx in range(settings.max_tool_rounds):
             rounds_used = round_idx + 1
-            round_span = _safe_tracer_call(
-                tracer.start_span,
+            round_span = safe_start_span(
+                tracer,
                 span,
                 name=f"subagent.tool_loop.round_{round_idx}",
                 metadata={"subagent.sub_id": sub_id},
@@ -169,15 +161,13 @@ async def run_subagent(
                     "tools": trace_tool_names(tools_schema),
                     "model": settings.model,
                 },
-                fallback=span,
             )
-            chat_span = _safe_tracer_call(
-                tracer.start_span,
+            chat_span = safe_start_span(
+                tracer,
                 round_span,
                 name="provider.achat",
                 metadata={"subagent.sub_id": sub_id, "provider.model": settings.model},
                 inputs={"messages": trace_messages(messages), "tool_count": len(tools_schema or [])},
-                fallback=round_span,
             )
             try:
                 response = await provider.achat(
@@ -186,13 +176,13 @@ async def run_subagent(
                     tools=tools_schema or None,
                 )
             except Exception as exc:
-                _safe_tracer_call(
-                    tracer.finish_span, chat_span,
-                    status="error", metadata={"error": str(exc)}, fallback=None,
+                safe_finish_span(
+                    tracer, chat_span,
+                    status="error", metadata={"error": str(exc)},
                 )
-                _safe_tracer_call(
-                    tracer.finish_span, round_span,
-                    status="error", fallback=None,
+                safe_finish_span(
+                    tracer, round_span,
+                    status="error",
                 )
                 raise
 
@@ -209,23 +199,22 @@ async def run_subagent(
                 "tool_calls": trace_tool_calls(response.tool_calls),
                 "usage": dict(final_usage),
             }
-            _safe_tracer_call(
-                tracer.finish_span, chat_span,
+            safe_finish_span(
+                tracer, chat_span,
                 status="ok",
                 metadata={"provider.usage": final_usage},
                 outputs=round_outputs,
-                fallback=None,
             )
 
             if not response.tool_calls:
-                _safe_tracer_call(
-                    tracer.finish_span, round_span,
-                    status="ok", outputs=round_outputs, fallback=None,
+                safe_finish_span(
+                    tracer, round_span,
+                    status="ok", outputs=round_outputs,
                 )
                 _emit_completed(on_event, sub_id, "completed", last_response_text, rounds_used)
-                _safe_tracer_call(
-                    tracer.finish_span, span,
-                    status="ok", metadata={"rounds_used": rounds_used}, fallback=None,
+                safe_finish_span(
+                    tracer, span,
+                    status="ok", metadata={"rounds_used": rounds_used},
                 )
                 return SubagentResult(
                     sub_id=sub_id,
@@ -278,12 +267,11 @@ async def run_subagent(
                             tool_calls=getattr(msg, "tool_calls", None),
                         )
 
-            _safe_tracer_call(
-                tracer.finish_span, round_span,
+            safe_finish_span(
+                tracer, round_span,
                 status="ok",
                 metadata={"tool_calls": len(response.tool_calls)},
                 outputs=round_outputs,
-                fallback=None,
             )
 
             # Track consecutive tool errors.

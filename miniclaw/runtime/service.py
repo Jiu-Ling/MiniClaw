@@ -12,6 +12,13 @@ from langgraph.graph import END, START, StateGraph
 
 from miniclaw.memory.files import MemoryFileStore
 from miniclaw.observability.contracts import NoopTracer, TraceContext
+from miniclaw.observability.safe import (
+    safe_finish_run,
+    safe_finish_span,
+    safe_record_event,
+    safe_start_run,
+    safe_start_span,
+)
 from miniclaw.persistence.memory_store import MemoryItem, MemoryStore
 from miniclaw.prompting.context import prompt_trace_scope
 from miniclaw.runtime.checkpoint import AsyncSQLiteCheckpointer
@@ -174,7 +181,7 @@ class RuntimeService:
         runtime_metadata: Mapping[str, object] | None = None,
         user_content_parts: list[dict[str, object]] | None = None,
     ) -> TurnResult:
-        run_context = _safe_start_run(
+        run_context = safe_start_run(
             self.tracer,
             name="runtime.turn",
             thread_id=thread_id,
@@ -223,14 +230,14 @@ class RuntimeService:
                 )
         except Exception as exc:
             final_output = {"error": str(exc)}
-            _safe_record_event(
+            safe_record_event(
                 self.tracer,
                 run_context,
                 name="runtime.error",
                 payload=final_output,
                 status="error",
             )
-            _safe_finish_run(self.tracer, run_context, status=final_status, output=final_output)
+            safe_finish_run(self.tracer, run_context, status=final_status, output=final_output)
             raise
         snapshot = app.get_state(config)
         checkpoint_id = None
@@ -259,7 +266,7 @@ class RuntimeService:
             "checkpoint_id": turn_result.checkpoint_id,
             "fleet_run_count": len(fleet_runs) if isinstance(fleet_runs, list) else 0,
         }
-        _safe_record_event(
+        safe_record_event(
             self.tracer,
             run_context,
             name="fleet.status",
@@ -268,14 +275,14 @@ class RuntimeService:
             },
             status=final_status,
         )
-        _safe_record_event(
+        safe_record_event(
             self.tracer,
             run_context,
             name="runtime.result",
             payload=final_output,
             status=final_status,
         )
-        _safe_finish_run(self.tracer, run_context, status=final_status, output=final_output)
+        safe_finish_run(self.tracer, run_context, status=final_status, output=final_output)
         return turn_result
 
     def run_turn_stream(
@@ -289,7 +296,7 @@ class RuntimeService:
         from queue import Queue
         from threading import Thread
 
-        run_context = _safe_start_run(
+        run_context = safe_start_run(
             self.tracer,
             name="runtime.turn.stream",
             thread_id=thread_id,
@@ -368,7 +375,7 @@ class RuntimeService:
 
         if error_holder[0] is not None:
             final_output = {"error": str(error_holder[0])}
-            _safe_finish_run(self.tracer, run_context, status="error", output=final_output)
+            safe_finish_run(self.tracer, run_context, status="error", output=final_output)
             yield StreamEvent(
                 kind="result",
                 result=TurnResult(
@@ -400,7 +407,7 @@ class RuntimeService:
             trace_context=run_context,
         )
         final_status = "error" if turn_result.last_error else "ok"
-        _safe_finish_run(self.tracer, run_context, status=final_status, output={
+        safe_finish_run(self.tracer, run_context, status=final_status, output={
             "response_text": turn_result.response_text,
             "last_error": turn_result.last_error,
         })
@@ -571,7 +578,7 @@ class RuntimeService:
 
         memory_span = None
         if trace_context is not None:
-            memory_span = _safe_start_span(
+            memory_span = safe_start_span(
                 self.tracer,
                 trace_context,
                 name="memory.record_turn",
@@ -580,7 +587,7 @@ class RuntimeService:
         now = self.clock()
         summary = self._build_thread_digest(now=now, user_input=user_input, result=result)
         timestamp = self._format_timestamp(now)
-        _safe_record_event(
+        safe_record_event(
             self.tracer,
             memory_span or trace_context,
             name="memory.thread_summary",
@@ -608,7 +615,7 @@ class RuntimeService:
 
         extracted = self._extract_durable_facts(user_input=user_input, timestamp=timestamp)
         if extracted:
-            _safe_record_event(
+            safe_record_event(
                 self.tracer,
                 memory_span or trace_context,
                 name="memory.extracted_facts",
@@ -628,41 +635,41 @@ class RuntimeService:
             )
 
         if self.memory_file_store is None:
-            _safe_finish_span(
+            safe_finish_span(
                 self.tracer,
                 memory_span,
                 status="ok",
-                output={"extracted_fact_count": len(extracted), "consolidated": False},
+                outputs={"extracted_fact_count": len(extracted), "consolidated": False},
             )
             return
         if not self._should_consolidate(thread_id=thread_id, high_importance=high_importance):
-            _safe_finish_span(
+            safe_finish_span(
                 self.tracer,
                 memory_span,
                 status="ok",
-                output={"extracted_fact_count": len(extracted), "consolidated": False},
+                outputs={"extracted_fact_count": len(extracted), "consolidated": False},
             )
             return
         consolidate_span = None
         if memory_span is not None:
-            consolidate_span = _safe_start_span(
+            consolidate_span = safe_start_span(
                 self.tracer,
                 memory_span,
                 name="memory.consolidate",
                 metadata={"thread_id": thread_id},
             )
         self._safe_memory_write(lambda: self._consolidate_thread_memory(thread_id, trace_context=consolidate_span))
-        _safe_finish_span(
+        safe_finish_span(
             self.tracer,
             consolidate_span,
             status="ok",
-            output={"thread_id": thread_id},
+            outputs={"thread_id": thread_id},
         )
-        _safe_finish_span(
+        safe_finish_span(
             self.tracer,
             memory_span,
             status="ok",
-            output={"extracted_fact_count": len(extracted), "consolidated": True},
+            outputs={"extracted_fact_count": len(extracted), "consolidated": True},
         )
 
     def _should_consolidate(self, *, thread_id: str, high_importance: bool) -> bool:
@@ -704,7 +711,7 @@ class RuntimeService:
             recent_work=recent_work,
         )
         self._write_daily_md(thread_id=thread_id, summaries=summaries)
-        _safe_record_event(
+        safe_record_event(
             self.tracer,
             trace_context,
             name="memory.consolidated",
@@ -927,85 +934,6 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _safe_start_run(
-    tracer: object,
-    *,
-    name: str,
-    thread_id: str | None = None,
-    metadata: Mapping[str, Any] | None = None,
-) -> TraceContext:
-    try:
-        return tracer.start_run(name=name, thread_id=thread_id, metadata=metadata)
-    except Exception:
-        return NoopTracer().start_run(name=name, thread_id=thread_id, metadata=metadata)
-
-
-def _safe_finish_run(
-    tracer: object,
-    context: TraceContext | None,
-    *,
-    status: str,
-    output: Mapping[str, Any] | None = None,
-) -> None:
-    if context is None:
-        return
-    try:
-        tracer.finish_run(context, status=status, output=output)
-    except Exception:
-        return
-
-
-def _safe_start_span(
-    tracer: object,
-    parent: TraceContext | None,
-    *,
-    name: str,
-    metadata: Mapping[str, Any] | None = None,
-    inputs: Mapping[str, Any] | None = None,
-    run_type: str | None = None,
-) -> TraceContext | None:
-    if parent is None:
-        return None
-    try:
-        return tracer.start_span(parent, name=name, metadata=metadata, inputs=inputs, run_type=run_type)
-    except Exception:
-        return NoopTracer().start_span(parent, name=name, metadata=metadata)
-
-
-def _safe_finish_span(
-    tracer: object,
-    context: TraceContext | None,
-    *,
-    status: str,
-    output: Mapping[str, Any] | None = None,
-    outputs: Mapping[str, Any] | None = None,
-) -> None:
-    if context is None:
-        return
-    try:
-        tracer.finish_span(context, status=status, output=output, outputs=outputs)
-    except Exception:
-        return
-
-
-def _safe_record_event(
-    tracer: object,
-    context: TraceContext | None,
-    *,
-    name: str,
-    payload: Mapping[str, Any] | None = None,
-    metadata: Mapping[str, Any] | None = None,
-    status: str | None = None,
-) -> None:
-    if context is None:
-        return
-    try:
-        tracer.record_event(context, name=name, payload=payload, metadata=metadata, status=status)
-    except Exception:
-        return
-
-
-
 def _wrap_tool_registry(
     tool_registry: object | None,
     *,
@@ -1043,7 +971,7 @@ class _TracingProviderProxy:
             "model": model,
             "tools": [dict(tool) for tool in tools or []],
         }
-        span = _safe_start_span(
+        span = safe_start_span(
             self._tracer,
             self._parent_context,
             name="provider.chat",
@@ -1054,9 +982,9 @@ class _TracingProviderProxy:
         try:
             response = await self._provider.achat(messages, model=model, tools=tools)
         except Exception as exc:
-            _safe_finish_span(self._tracer, span, status="error", output={"error": str(exc)})
+            safe_finish_span(self._tracer, span, status="error", outputs={"error": str(exc)})
             raise
-        _safe_finish_span(self._tracer, span, status="ok", outputs=_serialize_response(response))
+        safe_finish_span(self._tracer, span, status="ok", outputs=_serialize_response(response))
         return response
 
     async def astream_text(
@@ -1069,7 +997,7 @@ class _TracingProviderProxy:
             "messages": _serialize_messages(messages),
             "model": model,
         }
-        span = _safe_start_span(
+        span = safe_start_span(
             self._tracer,
             self._parent_context,
             name="provider.stream",
@@ -1083,9 +1011,9 @@ class _TracingProviderProxy:
                 collected_text += str(chunk)
                 yield str(chunk)
         except Exception as exc:
-            _safe_finish_span(self._tracer, span, status="error", output={"error": str(exc)})
+            safe_finish_span(self._tracer, span, status="error", outputs={"error": str(exc)})
             raise
-        _safe_finish_span(self._tracer, span, status="ok", outputs={"content": collected_text})
+        safe_finish_span(self._tracer, span, status="ok", outputs={"content": collected_text})
 
 
 class _TracingToolRegistryProxy:
@@ -1103,7 +1031,7 @@ class _TracingToolRegistryProxy:
         tool_name = call.name.strip() or "tool"
         registered = self._tool_registry.get(tool_name)
         tool_source = registered.spec.source if registered is not None else None
-        span = _safe_start_span(
+        span = safe_start_span(
             self._tracer,
             self._parent_context,
             name=f"tool.call.{tool_name}",
@@ -1113,9 +1041,9 @@ class _TracingToolRegistryProxy:
         try:
             result = self._tool_registry.execute(call, active_capabilities)
         except Exception as exc:
-            _safe_finish_span(self._tracer, span, status="error", output={"error": str(exc)})
+            safe_finish_span(self._tracer, span, status="error", outputs={"error": str(exc)})
             raise
-        _safe_finish_span(
+        safe_finish_span(
             self._tracer,
             span,
             status="error" if result.is_error else "ok",
