@@ -259,7 +259,7 @@ def make_load_context(
     memory_token_budget: int = 2000,
     mini_provider: ChatProvider | None = None,
     main_provider: ChatProvider | None = None,
-    settings: object | None = None,
+    settings: "Settings | None" = None,
     tracer: object | None = None,
 ) -> Callable[[RuntimeState], RuntimeState]:
     def load_context(state: RuntimeState) -> RuntimeState:
@@ -275,7 +275,7 @@ def make_load_context(
         rewrite_result = None
         if (
             settings is not None
-            and getattr(settings, "memory_rewrite_enabled", True)
+            and settings.memory_rewrite_enabled
             and user_input
         ):
             from miniclaw.memory.rewrite import RewriteInput, rewrite_query
@@ -283,7 +283,7 @@ def make_load_context(
             if rw_provider is not None:
                 recent = _extract_recent_exchanges(
                     state,
-                    n=int(getattr(settings, "memory_rewrite_recent_exchanges", 2) or 2),
+                    n=settings.memory_rewrite_recent_exchanges,
                 )
                 rewrite_inputs = RewriteInput(
                     user_input=user_input,
@@ -291,7 +291,7 @@ def make_load_context(
                 )
                 rewrite_span = safe_start_span(
                     tracer, parent_trace, name="memory.rewrite",
-                    metadata={"model_tier": str(getattr(settings, "memory_rewrite_model_tier", "auto"))},
+                    metadata={"model_tier": settings.memory_rewrite_model_tier},
                 )
                 try:
                     rewrite_result = _run_provider_sync(
@@ -299,7 +299,7 @@ def make_load_context(
                             rewrite_inputs,
                             provider=rw_provider,
                             model=_resolve_rewrite_model(settings),
-                            timeout_s=float(getattr(settings, "memory_rewrite_timeout_s", 1.0) or 1.0),
+                            timeout_s=settings.memory_rewrite_timeout_s,
                         )
                     )
                 except Exception:
@@ -356,12 +356,12 @@ def make_load_context(
 
 
 def _select_rewrite_provider(
-    settings: object,
+    settings: "Settings",
     mini_provider: ChatProvider | None,
     main_provider: ChatProvider | None,
 ) -> ChatProvider | None:
     """Select the provider for rewrite based on memory_rewrite_model_tier."""
-    tier = str(getattr(settings, "memory_rewrite_model_tier", "auto") or "auto")
+    tier = settings.memory_rewrite_model_tier
     if tier == "mini":
         return mini_provider
     if tier == "main":
@@ -369,15 +369,14 @@ def _select_rewrite_provider(
     return mini_provider or main_provider
 
 
-def _resolve_rewrite_model(settings: object) -> str:
+def _resolve_rewrite_model(settings: "Settings") -> str:
     """Resolve which model name to use for rewrite."""
-    tier = str(getattr(settings, "memory_rewrite_model_tier", "auto") or "auto")
+    tier = settings.memory_rewrite_model_tier
     if tier == "main":
-        return str(getattr(settings, "model", "") or "")
-    mini = getattr(settings, "mini_model", None)
-    if mini:
-        return str(mini)
-    return str(getattr(settings, "model", "") or "")
+        return settings.model
+    if settings.mini_model:
+        return settings.mini_model
+    return settings.model
 
 
 def _extract_recent_exchanges(
