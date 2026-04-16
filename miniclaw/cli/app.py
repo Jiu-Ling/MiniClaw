@@ -38,6 +38,71 @@ app.add_typer(telegram_app, name="telegram")
 trace_app = typer.Typer(name="trace", help="Trace inspection commands.", add_completion=False)
 app.add_typer(trace_app, name="trace")
 
+memory_app = typer.Typer(name="memory", help="Memory management commands.", add_completion=False)
+app.add_typer(memory_app, name="memory")
+
+
+@memory_app.command("rebuild")
+def memory_rebuild(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Drop and rebuild the memory index with parent-child chunking.
+
+    Destructive: drops memory_chunks, memory_parents, memory_fts, memory_vec,
+    and memory_dirty_files tables, then re-indexes all daily md files and
+    MEMORY.md under ~/.miniclaw/memory/ with the new parent-child schema.
+
+    Requires Ollama to be running for embedding generation.
+    """
+    from miniclaw.bootstrap import build_embedder, build_memory_indexer, build_settings
+
+    settings = build_settings()
+    memory_dir = settings.runtime_dir / "memory"
+    memory_md = settings.runtime_dir / "MEMORY.md"
+
+    md_files = sorted(memory_dir.glob("*.md")) if memory_dir.is_dir() else []
+    has_memory_md = memory_md.is_file()
+
+    typer.echo(f"Memory dir:  {memory_dir}")
+    typer.echo(f"MEMORY.md:   {memory_md} ({'exists' if has_memory_md else 'missing'})")
+    typer.echo(f"Daily files: {len(md_files)}")
+    typer.echo(f"SQLite:      {settings.sqlite_path}")
+    typer.echo()
+    typer.echo("This will DROP all memory index tables and rebuild from scratch.")
+
+    if not yes:
+        typer.confirm("Continue?", abort=True)
+
+    # Backup MEMORY.md before destructive operation
+    if has_memory_md:
+        bak = memory_md.with_suffix(".md.bak")
+        import shutil
+        shutil.copy2(memory_md, bak)
+        typer.echo(f"Backed up MEMORY.md → {bak.name}")
+
+    try:
+        embedder = build_embedder(settings)
+        indexer = build_memory_indexer(settings, embedder)
+    except Exception as exc:
+        typer.echo(f"Failed to initialize embedder/indexer: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo("Rebuilding index (this may take a minute for embedding)...")
+    try:
+        asyncio.run(indexer.rebuild_all())
+    except Exception as exc:
+        typer.echo(f"Rebuild failed: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    # Count results
+    import sqlite3
+    with sqlite3.connect(settings.sqlite_path) as conn:
+        parents = conn.execute("SELECT count(*) FROM memory_parents").fetchone()[0]
+        children = conn.execute("SELECT count(*) FROM memory_chunks").fetchone()[0]
+
+    typer.echo(f"Done: {parents} parents, {children} children indexed.")
+    typer.echo("Memory index is ready. Restart miniclaw to use the new index.")
+
 
 @trace_app.command("tail")
 def trace_tail(
