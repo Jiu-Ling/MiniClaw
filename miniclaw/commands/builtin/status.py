@@ -9,16 +9,13 @@ def cmd_status(ctx: CommandContext) -> CommandResult:
     runtime = ctx.runtime_service
     if runtime is None:
         return CommandResult(text="Runtime not available.")
-    resume = getattr(runtime, "resume_thread", None)
-    if not callable(resume):
-        return CommandResult(text="Status not available.")
-    checkpoint = resume(thread_id=ctx.thread_id)
+    checkpoint = runtime.resume_thread(thread_id=ctx.thread_id)
     if checkpoint is None:
         return CommandResult(text=f"No checkpoint found for thread={ctx.thread_id}")
-    response_text = str(getattr(checkpoint, "response_text", ""))
-    last_error = str(getattr(checkpoint, "last_error", ""))
-    message_count = getattr(checkpoint, "message_count", 0)
-    checkpoint_id = str(getattr(checkpoint, "checkpoint_id", ""))
+    response_text = str(checkpoint.response_text)
+    last_error = str(checkpoint.last_error)
+    message_count = checkpoint.message_count
+    checkpoint_id = str(checkpoint.checkpoint_id or "")
     lines = [f"Thread: {ctx.thread_id}", f"Checkpoint: {checkpoint_id}", f"Messages: {message_count}"]
     if last_error:
         lines.append(f"Last error: {last_error}")

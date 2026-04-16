@@ -9,10 +9,10 @@ def cmd_model(ctx: CommandContext) -> CommandResult:
     settings = ctx.settings
     if settings is None:
         return CommandResult(text="Settings not available.")
-    model = getattr(settings, "model", "unknown")
-    base_url = getattr(settings, "base_url", "unknown")
-    mini = getattr(settings, "mini_model", None) or "not configured"
-    mini_url = getattr(settings, "mini_model_base_url", None) or "N/A"
+    model = settings.model
+    base_url = settings.base_url
+    mini = settings.mini_model or "not configured"
+    mini_url = settings.mini_model_base_url or "N/A"
     lines = [
         f"Main model: {model}",
         f"Base URL: {base_url}",
