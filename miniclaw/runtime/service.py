@@ -4,7 +4,6 @@ from collections.abc import Iterator, Mapping
 import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import re
 from typing import TYPE_CHECKING, Any
 
 from langgraph.checkpoint.base import Checkpoint
@@ -34,9 +33,7 @@ if TYPE_CHECKING:
     from miniclaw.tools.registry import ToolRegistry
 
 THREAD_SUMMARY_KIND = "thread_summary"
-DURABLE_MEMORY_KINDS = {"fact", "preference", "project"}
 SUMMARY_CONSOLIDATION_THRESHOLD = 3
-SUMMARY_FETCH_LIMIT = 10
 
 
 @dataclass(slots=True)
@@ -574,270 +571,84 @@ class RuntimeService:
         result: TurnResult,
         trace_context: TraceContext | None = None,
     ) -> None:
-        append_fact = self.memory_store.append_fact
-
-        memory_span = None
-        if trace_context is not None:
-            memory_span = safe_start_span(
-                self.tracer,
-                trace_context,
-                name="memory.record_turn",
-                metadata={"thread_id": thread_id},
-            )
         now = self.clock()
-        summary = self._build_thread_digest(now=now, user_input=user_input, result=result)
-        timestamp = self._format_timestamp(now)
-        safe_record_event(
-            self.tracer,
-            memory_span or trace_context,
-            name="memory.thread_summary",
-            payload={
-                "thread_id": thread_id,
-                "summary": summary,
-                "timestamp": timestamp,
-                "failed": bool(str(result.last_error).strip()),
-            },
-        )
+        ts = self._format_timestamp(now)
+        user_short = " ".join(user_input.split())[:120]
+        outcome = str(result.last_error).strip() or str(result.response_text).strip()[:120] or "completed"
+        digest = f"{ts}: {user_short} | {outcome}"
 
         self._safe_memory_write(
-            lambda: append_fact(
-                thread_id,
-                summary,
-                THREAD_SUMMARY_KIND,
-                {
-                    "source": "runtime",
-                    "thread_id": thread_id,
-                    "timestamp": timestamp,
-                    "failed": bool(str(result.last_error).strip()),
-                },
+            lambda: self.memory_store.append_fact(
+                thread_id, digest, THREAD_SUMMARY_KIND,
+                {"source": "runtime", "thread_id": thread_id, "timestamp": ts},
             )
         )
 
-        extracted = self._extract_durable_facts(user_input=user_input, timestamp=timestamp)
-        if extracted:
-            safe_record_event(
-                self.tracer,
-                memory_span or trace_context,
-                name="memory.extracted_facts",
-                payload={"facts": extracted},
-            )
-        high_importance = False
-        for item in extracted:
-            importance = str(item["metadata"].get("importance", "")).strip().lower()
-            high_importance = high_importance or importance == "high"
-            self._safe_memory_write(
-                lambda payload=item: append_fact(
-                    thread_id,
-                    str(payload["content"]),
-                    str(payload["kind"]),
-                    dict(payload["metadata"]),
-                )
-            )
-
-        if self.memory_file_store is None:
-            safe_finish_span(
-                self.tracer,
-                memory_span,
-                status="ok",
-                outputs={"extracted_fact_count": len(extracted), "consolidated": False},
-            )
-            return
-        if not self._should_consolidate(thread_id=thread_id, high_importance=high_importance):
-            safe_finish_span(
-                self.tracer,
-                memory_span,
-                status="ok",
-                outputs={"extracted_fact_count": len(extracted), "consolidated": False},
-            )
-            return
-        consolidate_span = None
-        if memory_span is not None:
-            consolidate_span = safe_start_span(
-                self.tracer,
-                memory_span,
-                name="memory.consolidate",
-                metadata={"thread_id": thread_id},
-            )
-        self._safe_memory_write(lambda: self._consolidate_thread_memory(thread_id, trace_context=consolidate_span))
-        safe_finish_span(
-            self.tracer,
-            consolidate_span,
-            status="ok",
-            outputs={"thread_id": thread_id},
-        )
-        safe_finish_span(
-            self.tracer,
-            memory_span,
-            status="ok",
-            outputs={"extracted_fact_count": len(extracted), "consolidated": True},
-        )
-
-    def _should_consolidate(self, *, thread_id: str, high_importance: bool) -> bool:
-        if high_importance:
-            return True
-        summaries = self._list_recent_by_kind(
-            thread_id,
-            THREAD_SUMMARY_KIND,
-            limit=SUMMARY_CONSOLIDATION_THRESHOLD,
-        )
-        return len(summaries) >= SUMMARY_CONSOLIDATION_THRESHOLD
-
-    def _consolidate_thread_memory(self, thread_id: str, trace_context: TraceContext | None = None) -> None:
-        if self.memory_file_store is None:
+        if not self._should_trigger_consolidation(thread_id):
             return
 
-        document = self.memory_file_store.read()
-        summaries = list(
-            reversed(
-                self._list_recent_by_kind(
-                    thread_id,
-                    THREAD_SUMMARY_KIND,
-                    limit=self.memory_file_store.recent_work_limit,
-                )
+        from miniclaw.memory.consolidation import llm_consolidate, regex_consolidate_fallback
+        from miniclaw.runtime.background import BackgroundJob
+
+        memory_path = self.settings.runtime_dir / "MEMORY.md"
+        daily_dir = self.settings.runtime_dir / "memory"
+        threshold = int(getattr(self.settings, "memory_consolidation_trigger_threshold", 3) or 3)
+        digests = [
+            item.content for item in
+            self.memory_store.list_recent_by_kind(thread_id, THREAD_SUMMARY_KIND, threshold)
+        ]
+
+        provider = self._select_consolidation_provider()
+        model = self._resolve_consolidation_model()
+
+        def _run():
+            import asyncio
+            asyncio.run(llm_consolidate(
+                thread_id=thread_id, provider=provider, model=model,
+                memory_path=memory_path, digests=digests,
+                recent_exchanges=[], daily_dir=daily_dir,
+                indexer=self.memory_indexer,
+                critical_max=int(getattr(self.settings, "memory_critical_facts_max", 12) or 12),
+            ))
+
+        def _fallback(exc):
+            regex_consolidate_fallback(
+                thread_id=thread_id, memory_path=memory_path, digests=digests,
             )
+
+        job = BackgroundJob(
+            fn=_run if provider else lambda: _fallback(None),
+            kind="memory.consolidate",
+            metadata={"thread_id": thread_id},
+            on_failure=_fallback,
+            parent_trace=trace_context,
         )
-        durable_facts = list(reversed(self._list_recent_durable_facts(thread_id, limit=SUMMARY_FETCH_LIMIT)))
+        self._dispatch_background(job)
 
-        long_term_facts = self._merge_fact_lines(
-            document.long_term_facts,
-            [item.content for item in durable_facts],
-        )
-        recent_work = dict(document.recent_work)
-        if summaries:
-            recent_work[f"thread:{thread_id}"] = [item.content for item in summaries]
+    def _should_trigger_consolidation(self, thread_id: str) -> bool:
+        if not getattr(self.settings, "memory_consolidation_enabled", False):
+            return False
+        threshold = int(getattr(self.settings, "memory_consolidation_trigger_threshold", 3) or 3)
+        summaries = self.memory_store.list_recent_by_kind(thread_id, THREAD_SUMMARY_KIND, threshold)
+        return len(summaries) >= threshold
 
-        self.memory_file_store.update(
-            long_term_facts=long_term_facts,
-            recent_work=recent_work,
-        )
-        self._write_daily_md(thread_id=thread_id, summaries=summaries)
-        safe_record_event(
-            self.tracer,
-            trace_context,
-            name="memory.consolidated",
-            payload={
-                "thread_id": thread_id,
-                "long_term_facts": long_term_facts,
-                "recent_work": recent_work,
-            },
-        )
+    def _select_consolidation_provider(self):
+        tier = str(getattr(self.settings, "memory_consolidation_model_tier", "auto") or "auto")
+        if tier == "mini":
+            return self.mini_provider
+        if tier == "main":
+            return self.provider
+        return self.mini_provider or self.provider
 
-    def _write_daily_md(
-        self,
-        *,
-        thread_id: str,
-        summaries: list,
-    ) -> None:
-        if not summaries:
-            return
-        settings = self.settings
-        runtime_dir = settings.runtime_dir
-        if runtime_dir is None:
-            return
-
-        today = self.clock().strftime("%Y-%m-%d")
-        memory_dir = runtime_dir / "memory"
-        memory_dir.mkdir(parents=True, exist_ok=True)
-        daily_path = memory_dir / f"{today}.md"
-
-        if not daily_path.exists():
-            daily_path.write_text(f"# {today}\n", encoding="utf-8")
-
-        section = f"\n### thread:{thread_id}\n"
-        section += "\n".join(f"- [summary] {s.content}" for s in summaries)
-        section += "\n"
-
-        with daily_path.open("a", encoding="utf-8") as f:
-            f.write(section)
-
-        if self.memory_indexer is not None:
-            self.memory_indexer.mark_dirty(f"{today}.md")
-
-    def _list_recent_durable_facts(self, thread_id: str, *, limit: int) -> list[MemoryItem]:
-        items = self._list_recent_items(thread_id, limit=limit)
-        return [item for item in items if item.kind in DURABLE_MEMORY_KINDS]
+    def _resolve_consolidation_model(self) -> str:
+        tier = str(getattr(self.settings, "memory_consolidation_model_tier", "auto") or "auto")
+        if tier == "main":
+            return str(getattr(self.settings, "model", "") or "")
+        mini = getattr(self.settings, "mini_model", None)
+        return str(mini) if mini else str(getattr(self.settings, "model", "") or "")
 
     def _list_recent_by_kind(self, thread_id: str, kind: str, *, limit: int) -> list[MemoryItem]:
         return self.memory_store.list_recent_by_kind(thread_id, kind, limit)
-
-    def _list_recent_items(self, thread_id: str, *, limit: int) -> list[MemoryItem]:
-        return self.memory_store.list_recent(thread_id, limit)
-
-    def _extract_durable_facts(
-        self,
-        *,
-        user_input: str,
-        timestamp: str,
-    ) -> list[dict[str, object]]:
-        text = " ".join(user_input.split())
-        if not text:
-            return []
-
-        normalized = text.rstrip(". ")
-        lowered = normalized.lower()
-        items: list[dict[str, object]] = []
-
-        if "remember that " in lowered:
-            remembered = normalized[lowered.index("remember that ") + len("remember that ") :]
-            extracted = self._classify_durable_fact(remembered, importance="high", timestamp=timestamp)
-            if extracted is not None:
-                items.append(extracted)
-            return items
-
-        if lowered.startswith("prefer "):
-            extracted = self._classify_durable_fact(normalized, importance="normal", timestamp=timestamp)
-            if extracted is not None:
-                items.append(extracted)
-
-        return items
-
-    def _classify_durable_fact(
-        self,
-        text: str,
-        *,
-        importance: str,
-        timestamp: str,
-    ) -> dict[str, object] | None:
-        normalized = self._canonicalize_fact_text(text)
-        lowered = normalized.lower()
-        if not normalized:
-            return None
-
-        kind = "fact"
-        if lowered.startswith("prefer "):
-            kind = "preference"
-        elif lowered.startswith("use ") or lowered.startswith("only support "):
-            kind = "project"
-
-        return {
-            "content": normalized,
-            "kind": kind,
-            "metadata": {
-                "importance": importance,
-                "source": "runtime",
-                "timestamp": timestamp,
-            },
-        }
-
-    _DIGEST_OUTCOME_MAX_CHARS = 120
-
-    def _build_thread_digest(
-        self,
-        *,
-        now: datetime,
-        user_input: str,
-        result: TurnResult,
-    ) -> str:
-        user_summary = self._summarize_user_input(user_input)
-        if str(result.last_error).strip():
-            outcome = f"failed: {result.last_error}"
-        else:
-            outcome = result.response_text.strip()
-        if not outcome:
-            outcome = "completed"
-        if len(outcome) > self._DIGEST_OUTCOME_MAX_CHARS:
-            outcome = outcome[: self._DIGEST_OUTCOME_MAX_CHARS] + "..."
-        return f"{self._format_timestamp(now)}: User asked to {user_summary}; outcome: {outcome}"
 
     def _resolve_user_input(self, final_state: Mapping[str, Any]) -> str:
         user_input = str(final_state.get("user_input", "")).strip()
@@ -850,43 +661,6 @@ class RuntimeService:
                 if role == "user":
                     return self._extract_message_text(content, content_parts)
         return ""
-
-    @staticmethod
-    def _summarize_user_input(user_input: str) -> str:
-        text = " ".join(user_input.split()).rstrip(". ")
-        if not text:
-            return "continue the thread"
-        text = text[:96].strip()
-        if text:
-            text = text[0].lower() + text[1:]
-        return text
-
-    @staticmethod
-    def _canonicalize_fact_text(text: str) -> str:
-        normalized = " ".join(text.split()).strip()
-        if not normalized:
-            return ""
-        normalized = re.sub(r"^(please|that)\s+", "", normalized, flags=re.IGNORECASE)
-        normalized = re.sub(r"^we\s+(use|only support)\s+", r"\1 ", normalized, flags=re.IGNORECASE)
-        normalized = normalized.rstrip(". ")
-        if normalized:
-            normalized = normalized[0].upper() + normalized[1:]
-        return f"{normalized}."
-
-    @staticmethod
-    def _merge_fact_lines(existing: list[str], incoming: list[str]) -> list[str]:
-        merged: list[str] = []
-        seen: set[str] = set()
-        for line in [*existing, *incoming]:
-            normalized = " ".join(str(line).split()).strip()
-            if not normalized:
-                continue
-            key = normalized.casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(normalized)
-        return merged
 
     @staticmethod
     def _format_timestamp(value: datetime) -> str:
