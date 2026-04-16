@@ -6,29 +6,44 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
+
+from pydantic import BaseModel, Field
 
 from miniclaw.memory.files import MemoryFileStore
-from miniclaw.providers.contracts import ChatMessage
 
 if TYPE_CHECKING:
     from miniclaw.memory.indexer import MemoryIndexer
     from miniclaw.providers.contracts import ChatProvider
-from miniclaw.utils.jsonx import extract_json_object
 
 logger = logging.getLogger(__name__)
-__all__ = ["ConsolidationResult", "llm_consolidate", "regex_consolidate_fallback"]
+__all__ = [
+    "ConsolidationResponseSchema",
+    "ConsolidationResult",
+    "llm_consolidate",
+    "regex_consolidate_fallback",
+]
 
-_PROMPT = (
-    "## Existing facts\n{facts}\n\n## Exchanges\n{exchanges}\n\n## Digests\n{digests}\n\n"
-    "Classification: CRITICAL only if stable user preference, forgetting repeats mistake, "
-    "applies broadly, stated by user. Never critical: task state, implementation details.\n\n"
-    "Output strict JSON:\n"
-    '{{"thread_narrative":"3-5 sentences","long_term_facts":[{{"fact":"str",'
-    '"tier":"critical|normal","reason":"why","action":"add|update|skip_duplicate",'
-    '"updates_fact_id":null}}],"trace":{{"confidence":0.85}}}}'
-)
 
+# --- Pydantic schema for structured output --------------------------------
+
+class _FactEntry(BaseModel):
+    fact: str = ""
+    tier: str = Field(default="normal", description="critical | normal")
+    reason: str = Field(default="", description="Why this tier")
+    action: str = Field(default="add", description="add | update | skip_duplicate")
+    updates_fact_id: int | None = None
+
+
+class ConsolidationResponseSchema(BaseModel):
+    """Pydantic schema for provider.achat_structured(). Exported for callers."""
+
+    thread_narrative: str = Field(description="3-5 sentence summary of this segment")
+    long_term_facts: list[_FactEntry] = Field(default_factory=list)
+    trace: dict = Field(default_factory=lambda: {"confidence": 0.0})
+
+
+# --- Result dataclass -----------------------------------------------------
 
 @dataclass(frozen=True)
 class ConsolidationResult:
@@ -41,44 +56,68 @@ class ConsolidationResult:
     fallback_triggered: bool = False
 
 
+# --- Core function --------------------------------------------------------
+
 async def llm_consolidate(
-    *, thread_id: str, provider: ChatProvider, model: str, memory_path: Path,
-    digests: list[str], recent_exchanges: list[tuple[str, str]],
-    daily_dir: Path | None = None, indexer: MemoryIndexer | None = None, critical_max: int = 12,
+    *,
+    thread_id: str,
+    provider: ChatProvider,
+    model: str,
+    memory_path: Path,
+    digests: list[str],
+    recent_exchanges: list[tuple[str, str]],
+    daily_dir: Path | None = None,
+    indexer: MemoryIndexer | None = None,
+    critical_max: int = 12,
 ) -> ConsolidationResult:
     """Run LLM consolidation. RAISES on any failure."""
     crit, norm, recent = _read_memory(memory_path)
-    msgs = _build_prompt(crit, norm, digests, recent_exchanges)
-    resp = await asyncio.wait_for(provider.achat(msgs, model=model, tools=None), timeout=30.0)
-    raw = str(resp.content or "")
-    parsed = extract_json_object(raw, default=None)
-    if not parsed or "thread_narrative" not in parsed:
-        raise ValueError(f"invalid consolidation JSON: {raw[:200]}")
-    narrative = str(parsed.get("thread_narrative", "")).strip()
+    messages = _build_messages(crit, norm, digests, recent_exchanges)
+
+    # Prefer achat_structured (function-calling based); fall back to raw achat + parse
+    achat_structured = getattr(provider, "achat_structured", None)
+    if achat_structured is not None:
+        parsed = await asyncio.wait_for(
+            achat_structured(messages, schema=ConsolidationResponseSchema, model=model),
+            timeout=30.0,
+        )
+    else:
+        from miniclaw.utils.jsonx import extract_json_object
+        resp = await asyncio.wait_for(
+            provider.achat(messages, model=model, tools=None),
+            timeout=30.0,
+        )
+        raw = str(resp.content or "")
+        raw_parsed = extract_json_object(raw, default=None)
+        if not raw_parsed or "thread_narrative" not in raw_parsed:
+            raise ValueError(f"invalid consolidation JSON: {raw[:200]}")
+        parsed = ConsolidationResponseSchema(**raw_parsed)
+
+    narrative = (parsed.thread_narrative or "").strip()
     if not narrative:
         raise ValueError("empty thread_narrative")
 
-    trace = parsed.get("trace", {})
-    confidence = float(trace.get("confidence", 0.0)) if isinstance(trace, dict) else 0.0
+    confidence = 0.0
+    if isinstance(parsed.trace, dict):
+        confidence = float(parsed.trace.get("confidence", 0.0))
+
     new_crit, new_norm = list(crit), list(norm)
     added = updated = skipped = n_crit = 0
 
-    for entry in (parsed.get("long_term_facts", []) or []):
-        if not isinstance(entry, dict):
-            continue
-        fact = str(entry.get("fact", "")).strip()
+    for entry in parsed.long_term_facts:
+        fact = entry.fact.strip()
         if not fact:
             continue
-        action = str(entry.get("action", "add")).strip()
-        tier = str(entry.get("tier", "normal")).strip()
-        reason = str(entry.get("reason", "")).strip()
+        action = entry.action.strip()
+        tier = entry.tier.strip()
+        reason = entry.reason.strip()
         if action == "skip_duplicate":
             skipped += 1
             continue
         if tier == "critical" and not reason:
             tier = "normal"
         if action == "update":
-            fid = entry.get("updates_fact_id")
+            fid = entry.updates_fact_id
             if isinstance(fid, int) and 0 <= fid < len(new_crit) + len(new_norm):
                 if fid < len(new_crit):
                     new_crit[fid] = fact
@@ -118,6 +157,8 @@ def regex_consolidate_fallback(*, thread_id: str, memory_path: Path, digests: li
     doc.recent_work[key] = entries[-3:]
     store.update(long_term_facts=doc.long_term_facts, recent_work=doc.recent_work)
 
+
+# --- Helpers --------------------------------------------------------------
 
 def _read_memory(path: Path) -> tuple[list[str], list[str], dict[str, list[str]]]:
     if not path.is_file():
@@ -185,18 +226,27 @@ def _write_daily(daily_dir: Path, thread_id: str, narrative: str, indexer: Memor
             pass
 
 
-def _build_prompt(
+_SYSTEM = "Output strict JSON only. No prose. No code fences."
+
+_USER_TEMPLATE = (
+    "## Existing facts\n{facts}\n\n## Exchanges\n{exchanges}\n\n## Digests\n{digests}\n\n"
+    "Classification: CRITICAL only if stable user preference, forgetting repeats mistake, "
+    "applies broadly, stated by user. Never critical: task state, implementation details."
+)
+
+
+def _build_messages(
     crit: list[str], norm: list[str], digests: list[str], recent: list[tuple[str, str]],
-) -> list[ChatMessage]:
+) -> list[dict[str, str]]:
     facts = "".join(f"[id:{i}] [CRITICAL] {f}\n" for i, f in enumerate(crit))
     facts += "".join(f"[id:{len(crit)+i}] {f}\n" for i, f in enumerate(norm))
     exchanges = "".join(f"User: {u[:200]}\nAssistant: {a[:200]}\n" for u, a in recent)
-    content = _PROMPT.format(
+    content = _USER_TEMPLATE.format(
         facts=facts or "(none)",
         exchanges=exchanges or "(none)",
         digests="\n".join(f"- {d}" for d in digests) or "(none)",
     )
     return [
-        ChatMessage(role="system", content="Output strict JSON only. No prose. No code fences."),
-        ChatMessage(role="user", content=content),
+        {"role": "system", "content": _SYSTEM},
+        {"role": "user", "content": content},
     ]
