@@ -139,7 +139,8 @@ def _ms(start: float) -> int:
 
 _SYSTEM = (
     "You are a memory retrieval assistant. "
-    "Classify the user's intent and rewrite their message into a self-contained retrieval query."
+    "Classify the user's intent and rewrite their message into a self-contained retrieval query. "
+    "Respond in JSON format."
 )
 
 _USER_TEMPLATE = """\

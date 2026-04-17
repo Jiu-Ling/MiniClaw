@@ -199,14 +199,18 @@ class OpenAICompatibleProvider(ChatProvider):
             base_url=self.base_url,
             model=model or self.model,
         )
-        structured = llm.with_structured_output(schema)
+        # Prefer function_calling (tool use) over json_object response_format.
+        # Some OpenAI-compatible providers (DashScope/Qwen) require the word
+        # "json" in messages when using json_object mode; function_calling
+        # avoids this constraint entirely.
+        structured = llm.with_structured_output(schema, method="function_calling")
         # Normalize messages to dicts if they're ChatMessage objects
         normalized = []
         for msg in messages:
             if isinstance(msg, dict):
                 normalized.append(msg)
             else:
-                normalized.append({"role": getattr(msg, "role", "user"), "content": getattr(msg, "content", "")})
+                normalized.append({"role": msg.role, "content": msg.content or ""})
         return await structured.ainvoke(normalized)
 
     async def astream_text(
