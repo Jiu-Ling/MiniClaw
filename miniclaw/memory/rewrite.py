@@ -68,26 +68,22 @@ async def rewrite_query(
     messages = _build_messages(inputs)
     start = time.monotonic()
     try:
-        achat_structured = getattr(provider, "achat_structured", None)
-        if achat_structured is not None:
-            response = await asyncio.wait_for(
-                achat_structured(messages, schema=RewriteResponseSchema, model=model or None),
-                timeout=timeout_s,
-            )
-        else:
-            # Fallback for providers without achat_structured: use raw achat + parse
-            from miniclaw.utils.jsonx import extract_json_object
-            raw_response = await asyncio.wait_for(
-                provider.achat(messages, model=model or None, tools=None),
-                timeout=timeout_s,
-            )
-            raw_text = str(raw_response.content or "")
-            parsed = extract_json_object(raw_text, default={})
-            response = RewriteResponseSchema(
-                rewritten_query=str(parsed.get("rewritten_query", "")),
-                keywords=parsed.get("keywords", []) if isinstance(parsed.get("keywords"), list) else [],
-                intent=str(parsed.get("intent", "ambiguous")),
-            )
+        # Use raw achat + extract_json_object for rewrite — it's a 3-field JSON,
+        # the lightweight path is faster and more compatible than achat_structured
+        # (which injects schema descriptions and uses json_mode/function_calling,
+        # adding latency that easily exceeds the 1s timeout on DashScope).
+        from miniclaw.utils.jsonx import extract_json_object
+        raw_response = await asyncio.wait_for(
+            provider.achat(messages, model=model or None, tools=None),
+            timeout=timeout_s,
+        )
+        raw_text = str(raw_response.content or "")
+        parsed = extract_json_object(raw_text, default={})
+        response = RewriteResponseSchema(
+            rewritten_query=str(parsed.get("rewritten_query", "")),
+            keywords=parsed.get("keywords", []) if isinstance(parsed.get("keywords"), list) else [],
+            intent=str(parsed.get("intent", "ambiguous")),
+        )
     except asyncio.TimeoutError:
         return _fallback(inputs, reason="timeout", latency_ms=_ms(start))
     except Exception as exc:
