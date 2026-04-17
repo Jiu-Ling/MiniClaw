@@ -199,11 +199,12 @@ class OpenAICompatibleProvider(ChatProvider):
             base_url=self.base_url,
             model=model or self.model,
         )
-        # Prefer function_calling (tool use) over json_object response_format.
-        # Some OpenAI-compatible providers (DashScope/Qwen) require the word
-        # "json" in messages when using json_object mode; function_calling
-        # avoids this constraint entirely.
-        structured = llm.with_structured_output(schema, method="function_calling")
+        # Use json_mode: sets response_format={"type": "json_object"} and lets
+        # the Pydantic schema describe the expected shape in the prompt.
+        # Avoids function_calling's tool_choice=required which DashScope/Qwen
+        # rejects in thinking mode. Requires "json" in the prompt (callers
+        # must include it — see rewrite.py and consolidation.py).
+        structured = llm.with_structured_output(schema, method="json_mode")
         # Normalize messages to dicts if they're ChatMessage objects
         normalized = []
         for msg in messages:
