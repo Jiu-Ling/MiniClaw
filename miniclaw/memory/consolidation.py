@@ -141,7 +141,6 @@ async def llm_consolidate(
     store.update(
         critical_preferences=new_crit,
         long_term_facts=new_norm,
-        recent_work={},
     )
     if daily_dir is not None:
         # Indexer is consolidation's concern, kept out of MemoryFileStore.
