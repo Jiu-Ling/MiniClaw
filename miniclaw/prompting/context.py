@@ -643,7 +643,7 @@ def _trim_history(
                 dropped_messages=[m for exchange in old_exchanges for m in exchange],
                 pinned_references=pinned,
                 thread_id=thread_id,
-                parent_trace=None,
+                parent_trace=_PROMPT_TRACE_CONTEXT.get(),
             )
             on_compression(event)
         except Exception:
