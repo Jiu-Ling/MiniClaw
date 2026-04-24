@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -61,6 +62,7 @@ class ContextBuilder:
         compress_keep_recent_turns: int | None = None,
         compress_turn_summary_chars: int | None = None,
         max_history_messages: int | None = None,
+        on_compression: Callable[[Any], None] | None = None,
     ) -> None:
         self.workspace = Path(workspace) if workspace is not None else self._default_workspace()
         self.bootstrap_loader = bootstrap_loader or BootstrapLoader(workspace=self.workspace)
@@ -72,6 +74,7 @@ class ContextBuilder:
         self.compress_keep_recent_turns = compress_keep_recent_turns or _DEFAULT_KEEP_RECENT_TURNS
         self.compress_turn_summary_chars = compress_turn_summary_chars or _DEFAULT_TURN_SUMMARY_CHARS
         self.max_history_messages = max_history_messages or _DEFAULT_MAX_HISTORY_MESSAGES
+        self.on_compression = on_compression
         self._last_compression_summary: str = ""
 
     def _build_static_sections(self, state: Mapping[str, Any] | None = None) -> list[str]:
@@ -195,6 +198,8 @@ class ContextBuilder:
                 keep_recent_turns=self.compress_keep_recent_turns,
                 turn_summary_chars=self.compress_turn_summary_chars,
                 max_history_messages=self.max_history_messages,
+                on_compression=self.on_compression,
+                thread_id=str(self._resolve_runtime_metadata(state).get("thread_id", "")),
             )
 
             messages = self._apply_message_cache_breakpoints(messages)
@@ -536,6 +541,8 @@ def _trim_history(
     keep_recent_turns: int = _DEFAULT_KEEP_RECENT_TURNS,
     turn_summary_chars: int = _DEFAULT_TURN_SUMMARY_CHARS,
     max_history_messages: int = _DEFAULT_MAX_HISTORY_MESSAGES,
+    on_compression: Callable[[Any], None] | None = None,
+    thread_id: str = "",
 ) -> tuple[list[ChatMessage], str]:
     """Compress old conversation turns when history exceeds limits.
 
@@ -605,6 +612,20 @@ def _trim_history(
     if remaining_total > budget:
         recent_msgs = _trim_tool_results_only(recent_msgs, remaining_total, budget)
         result = system_msgs + [summary_msg] + recent_msgs
+
+    if on_compression is not None:
+        try:
+            from miniclaw.memory.compression_promote import CompressionEvent
+            event = CompressionEvent(
+                dropped_messages=[m for exchange in old_exchanges for m in exchange],
+                pinned_references=pinned,
+                thread_id=thread_id,
+                parent_trace=None,
+            )
+            on_compression(event)
+        except Exception:
+            # Callback failures must never break compression itself.
+            pass
 
     return result, compression_summary
 
