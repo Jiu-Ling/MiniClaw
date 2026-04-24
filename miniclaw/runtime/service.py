@@ -495,7 +495,7 @@ class RuntimeService:
 
     @staticmethod
     def _strip_runtime_metadata(text: str) -> str:
-        metadata_marker = "\n\n## Runtime Metadata"
+        metadata_marker = "\n\n<system-reminder>"
         if metadata_marker in text:
             return text.split(metadata_marker, 1)[0]
         return text

@@ -6,9 +6,6 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 
-RUNTIME_METADATA_BLOCK_TITLE = "Runtime Metadata (metadata-only)"
-
-
 class RuntimeMetadata(BaseModel):
     """Runtime-only metadata that should stay out of the system prompt."""
 
@@ -29,11 +26,17 @@ _VISIBLE_KEYS = ("thread_id", "channel", "clock")
 
 
 def render_runtime_metadata_block(runtime_metadata: Mapping[str, Any] | RuntimeMetadata | None) -> str:
-    """Render runtime metadata as a compact annotation on the current user message.
+    """Render runtime metadata as a <system-reminder>-wrapped block.
 
-    Only includes keys in _VISIBLE_KEYS. Internal fields (_turn_run_id,
+    Used by ContextBuilder to inject metadata into the current-turn user message
+    without polluting the cache-eligible system prompt. The <system-reminder>
+    convention tells Claude-family models to treat content as system-level
+    rather than user input. Other providers see plain text and degrade
+    gracefully.
+
+    Only keys in _VISIBLE_KEYS are emitted. Internal fields (_turn_run_id,
     _turn_trace_id), user-sandbox paths, sender_id, user_id, and any key
-    starting with '_' are excluded to avoid confusing the LLM.
+    starting with '_' are excluded.
     """
     if runtime_metadata is None:
         return ""
@@ -46,13 +49,13 @@ def render_runtime_metadata_block(runtime_metadata: Mapping[str, Any] | RuntimeM
     if not values:
         return ""
 
-    lines = [f"## {RUNTIME_METADATA_BLOCK_TITLE}"]
+    inner_lines = []
     for key in _VISIBLE_KEYS:
         if key in values:
-            lines.append(f"{key}: {values[key]}")
+            inner_lines.append(f"{key}: {values[key]}")
 
-    # If no visible keys matched, don't emit an empty block
-    if len(lines) == 1:
+    if not inner_lines:
         return ""
 
-    return "\n".join(lines)
+    inner = "\n".join(inner_lines)
+    return f"<system-reminder>\nruntime_metadata:\n{inner}\n</system-reminder>"
