@@ -74,7 +74,6 @@ async def llm_consolidate(
     document = store.read()
     crit = list(document.critical_preferences)
     norm = list(document.long_term_facts)
-    recent = {k: list(v) for k, v in document.recent_work.items()}
     messages = _build_messages(crit, norm, digests, recent_exchanges)
 
     # Prefer achat_structured (function-calling based); fall back to raw achat + parse
@@ -139,11 +138,10 @@ async def llm_consolidate(
             new_norm.append(fact)
         added += 1
 
-    new_recent = {**recent, f"thread:{thread_id}": [narrative]}
     store.update(
         critical_preferences=new_crit,
         long_term_facts=new_norm,
-        recent_work=new_recent,
+        recent_work={},
     )
     if daily_dir is not None:
         # Indexer is consolidation's concern, kept out of MemoryFileStore.
