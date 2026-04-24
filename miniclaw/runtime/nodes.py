@@ -6,6 +6,7 @@ import uuid
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from miniclaw.observability.cache_event import emit_cache_usage
 from miniclaw.observability.safe import safe_finish_span, safe_start_span
 from miniclaw.utils.async_bridge import run_sync as _run_provider_sync
 from miniclaw.utils.jsonx import safe_loads_with_raw
@@ -540,6 +541,7 @@ def make_agent(
                         safe_finish_span(resolved_tracer, chat_span, status="error")
                         round_status = "error"
                         raise
+                    emit_cache_usage(resolved_tracer, chat_span, response)
                     safe_finish_span(
                         resolved_tracer,
                         chat_span,

@@ -4,6 +4,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
+from miniclaw.observability.cache_event import emit_cache_usage
 from miniclaw.observability.safe import safe_finish_span, safe_record_event, safe_start_span
 from miniclaw.runtime.tool_loop import (
     trace_messages,
@@ -199,6 +200,7 @@ async def run_subagent(
                 "tool_calls": trace_tool_calls(response.tool_calls),
                 "usage": dict(final_usage),
             }
+            emit_cache_usage(tracer, chat_span, response)
             safe_finish_span(
                 tracer, chat_span,
                 status="ok",
