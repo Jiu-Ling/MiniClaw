@@ -620,6 +620,7 @@ class RuntimeService:
         def _fallback(exc):
             regex_consolidate_fallback(
                 thread_id=thread_id, memory_path=memory_path, digests=digests,
+                daily_dir=daily_dir,
             )
 
         job = BackgroundJob(

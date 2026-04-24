@@ -162,19 +162,27 @@ async def llm_consolidate(
     )
 
 
-def regex_consolidate_fallback(*, thread_id: str, memory_path: Path, digests: list[str]) -> None:
-    """Minimal fallback: append digests to recent_work. No fact extraction."""
+def regex_consolidate_fallback(
+    *,
+    thread_id: str,
+    memory_path: Path,
+    digests: list[str],
+    daily_dir: Path | None = None,
+) -> None:
+    """Fallback when LLM consolidation fails. Writes a simple narrative built
+    from the most recent digests to the daily MD. Does NOT touch MEMORY.md
+    (no fact extraction in this branch).
+    """
     if not digests:
         return
-    store = MemoryFileStore(memory_path)
-    doc = store.read()
-    key = f"thread:{thread_id}"
-    entries = list(doc.recent_work.get(key, [])) + digests[-3:]
-    doc.recent_work[key] = entries[-3:]
-    store.update(
-        critical_preferences=doc.critical_preferences,
-        long_term_facts=doc.long_term_facts,
-        recent_work=doc.recent_work,
+    if daily_dir is None:
+        return
+    narrative = "\n".join(f"- {d}" for d in digests[-5:])
+    store = MemoryFileStore(memory_path, daily_dir=daily_dir)
+    store.append_to_daily_journal(
+        thread_id=thread_id,
+        narrative=narrative,
+        source="regex_fallback",
     )
 
 
