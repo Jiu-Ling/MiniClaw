@@ -332,7 +332,7 @@ def make_load_context(
                     ),
                 )
 
-        memory_context: object = None
+        memory_context: MemoryContext | None = None
         if thread_id:
             retrieve_span = safe_start_span(
                 tracer, parent_trace, name="memory.retrieve",
