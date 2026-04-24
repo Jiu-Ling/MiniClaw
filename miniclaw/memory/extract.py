@@ -5,18 +5,31 @@ from compressed conversation messages. Used by `_trim_history` to populate
 a `## Pinned References` block in the summary message — preserving verbatim
 references that would otherwise be lost to truncation.
 
-This module has zero dependencies on prompting/context. Phase 5 will add an
-async LLM-driven extractor in the same module.
+Phase 5 adds `CompressionExtraction` + `llm_extract_facts` for LLM-driven
+structured extraction of narratives and durable facts from compressed messages.
 """
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
+from pydantic import BaseModel, Field
+
+from miniclaw.memory.files import FactCandidate
 from miniclaw.providers.contracts import ChatMessage
 
-__all__ = ["PinnedReferences", "extract_pinned_references"]
+if TYPE_CHECKING:
+    from miniclaw.providers.contracts import ChatProvider
+
+__all__ = [
+    "PinnedReferences",
+    "extract_pinned_references",
+    "CompressionExtraction",
+    "llm_extract_facts",
+]
 
 _MAX_PER_CATEGORY = 20
 
@@ -134,4 +147,88 @@ def extract_pinned_references(messages: Iterable[ChatMessage]) -> PinnedReferenc
         urls=_dedup_capped(raw_urls),
         identifiers=_dedup_capped(raw_idents),
         code_blocks=_dedup_capped(raw_blocks, cap=5),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: LLM-driven structured extraction
+# ---------------------------------------------------------------------------
+
+class CompressionExtraction(BaseModel):
+    """LLM-extracted structured summary of a compressed message batch.
+
+    `narrative` — 3-5 sentence overview written to daily MD.
+    `facts_to_remember` — decision/preference facts for MEMORY.md.
+    `discovered_facts` — tool-result-derived facts (api endpoints, paths, etc).
+    Both lists pass through `add_facts_batch` with dedup.
+    """
+
+    narrative: str = Field(default="", description="3-5 sentence narrative summary")
+    facts_to_remember: list[FactCandidate] = Field(default_factory=list)
+    decisions_made: list[str] = Field(default_factory=list)
+    open_threads: list[str] = Field(default_factory=list)
+    discovered_facts: list[FactCandidate] = Field(default_factory=list)
+
+
+_LLM_EXTRACT_SYSTEM = """\
+You are extracting durable knowledge from compressed conversation turns.
+
+Rules:
+- `narrative`: 3-5 sentences summarizing what happened. Past tense.
+- `facts_to_remember`: explicit user preferences, project decisions, naming conventions.
+  Use tier="critical" ONLY for stable user preferences with `reason`. Default tier="normal".
+- `discovered_facts`: facts the agent learned from tool results (API endpoints, paths,
+  port numbers, version strings). source="compression".
+- Skip transient state (in-progress task names, "currently doing X").
+- Each fact <= 200 chars, narrative <= 500 chars.
+
+Output strict JSON matching the schema. No prose outside JSON."""
+
+
+def _format_messages_for_extraction(
+    messages: list[ChatMessage],
+    pinned: PinnedReferences,
+) -> list[ChatMessage]:
+    """Build [system, user] messages for the extraction LLM call."""
+    system = ChatMessage(role="system", content=_LLM_EXTRACT_SYSTEM)
+    body_parts: list[str] = []
+    if not pinned.is_empty():
+        body_parts.append("## Pinned References (already preserved verbatim)")
+        for p in pinned.paths:
+            body_parts.append(f"- path: {p}")
+        for u in pinned.urls:
+            body_parts.append(f"- url: {u}")
+        for ident in pinned.identifiers:
+            body_parts.append(f"- ident: {ident}")
+        body_parts.append("")
+    body_parts.append("## Compressed messages")
+    for m in messages:
+        text = m.content or "".join(
+            p.get("text", "") for p in (m.content_parts or []) if isinstance(p, dict)
+        )
+        body_parts.append(f"[{m.role}] {text[:1000]}")
+    user = ChatMessage(role="user", content="\n".join(body_parts))
+    return [system, user]
+
+
+async def llm_extract_facts(
+    *,
+    provider: "ChatProvider",
+    model: str,
+    compressed_messages: list[ChatMessage],
+    pinned_references: PinnedReferences,
+    timeout_s: float = 15.0,
+) -> CompressionExtraction:
+    """Run an LLM extraction over compressed messages. Raises on provider error.
+
+    Caller (compression_promote) wraps this in try/except — failures degrade
+    to "no LLM extraction this round; pinned refs already in summary".
+    """
+    achat_structured = getattr(provider, "achat_structured", None)
+    if achat_structured is None:
+        raise RuntimeError("provider does not support achat_structured")
+    messages = _format_messages_for_extraction(compressed_messages, pinned_references)
+    return await asyncio.wait_for(
+        achat_structured(messages, schema=CompressionExtraction, model=model),
+        timeout=timeout_s,
     )
