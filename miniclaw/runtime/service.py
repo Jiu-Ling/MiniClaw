@@ -104,6 +104,7 @@ class RuntimeService:
         self._checkpointer = AsyncSQLiteCheckpointer(settings.sqlite_path)
         self._persist_app = self._build_persist_app()
         self._compression_synced_threads: set[str] = set()
+        self._on_compression = self._build_on_compression()
         if memory_file_store is not None:
             setattr(self.memory_store, "memory_file_store", memory_file_store)
 
@@ -114,6 +115,54 @@ class RuntimeService:
         graph.add_edge(START, "persist")
         graph.add_edge("persist", END)
         return graph.compile(checkpointer=self._checkpointer)
+
+    def _build_on_compression(self) -> "Callable[[Any], None] | None":
+        """Compose the compression-promotion callback when settings and deps allow."""
+        if not self.settings.compression_extract_enabled:
+            return None
+        if self.background_scheduler is None:
+            return None
+        if self.memory_file_store is None:
+            return None
+
+        from miniclaw.memory.compression_promote import schedule_compression_promotion
+
+        tier = self.settings.compression_extract_model_tier
+        if tier == "mini" and self.mini_provider is not None:
+            compression_provider = self.mini_provider
+            compression_model = self.settings.mini_model or self.settings.model
+        elif tier == "main":
+            compression_provider = self.provider
+            compression_model = self.settings.model
+        else:  # auto
+            if self.mini_provider is not None:
+                compression_provider = self.mini_provider
+                compression_model = self.settings.mini_model or self.settings.model
+            else:
+                compression_provider = self.provider
+                compression_model = self.settings.model
+
+        memory_file_store = self.memory_file_store
+        indexer = self.memory_indexer
+        scheduler = self.background_scheduler
+        daily_dir = self.settings.runtime_dir / "memory" / "daily"
+        timeout_s = self.settings.compression_extract_timeout_s
+        critical_max = self.settings.memory_critical_facts_max
+
+        def _on_compression(event: Any) -> None:
+            schedule_compression_promotion(
+                scheduler=scheduler,
+                provider=compression_provider,
+                model=compression_model,
+                memory_store=memory_file_store,
+                indexer=indexer,
+                daily_dir=daily_dir,
+                event=event,
+                timeout_s=timeout_s,
+                critical_max=critical_max,
+            )
+
+        return _on_compression
 
     def with_messaging_bridge(self, bridge: MessagingBridge) -> "RuntimeService":
         bound = copy.copy(self)
@@ -208,6 +257,7 @@ class RuntimeService:
             indexer=self.memory_indexer,
             memory_token_budget=self.settings.memory_token_budget,
             tracer=self.tracer,
+            on_compression=self._on_compression,
         )
         app = graph.compile(checkpointer=self._checkpointer)
         config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
@@ -334,6 +384,7 @@ class RuntimeService:
             memory_token_budget=self.settings.memory_token_budget,
             on_event=on_event,
             tracer=self.tracer,
+            on_compression=self._on_compression,
         )
         app = graph.compile(checkpointer=self._checkpointer)
         config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}

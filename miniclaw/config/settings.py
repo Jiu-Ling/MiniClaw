@@ -123,6 +123,12 @@ class Settings(BaseSettings):
     memory_consolidation_trigger_threshold: int = 3
     memory_critical_facts_max: int = 12
 
+    # Compression promotion (Phase 5)
+    compression_extract_enabled: bool = True
+    compression_extract_model_tier: Literal["mini", "main", "auto"] = "mini"
+    compression_extract_timeout_s: float = 15.0
+    compression_pinned_extract_enabled: bool = True
+
     # Prompt caching strategy.
     # "auto" → bootstrap detects from base_url (anthropic/dashscope → "anthropic",
     #          openai → "openai_auto", unknown → "none").

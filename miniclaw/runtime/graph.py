@@ -146,6 +146,7 @@ def build_graph(
     memory_token_budget: int = 2000,
     on_event: Callable[[dict[str, Any]], None] | None = None,
     tracer: "Tracer | None" = None,
+    on_compression: "Callable[[Any], None] | None" = None,
 ) -> StateGraph:
     graph = StateGraph(RuntimeState)
     resolved_tracer = tracer or NoopTracer()
@@ -185,6 +186,7 @@ def build_graph(
             tool_registry=tool_registry,
             on_event=on_event,
             tracer=tracer,
+            on_compression=on_compression,
         ),
     ))
     graph.add_node("error_handler", wrap("error_handler", error_handler))

@@ -449,6 +449,7 @@ def make_agent(
     tool_registry: ToolRegistry | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
     tracer: "Tracer | None" = None,
+    on_compression: Callable[[Any], None] | None = None,
 ) -> Callable[[RuntimeState], RuntimeState]:
     from miniclaw.observability.contracts import NoopTracer, build_run_context
     resolved_tracer = tracer or NoopTracer()
@@ -460,6 +461,7 @@ def make_agent(
         mcp_registry=tool_registry.mcp_registry if tool_registry is not None else None,
         history_char_budget=settings.history_char_budget,
         max_history_messages=settings.max_history_messages,
+        on_compression=on_compression,
     )
 
     max_rounds = settings.max_tool_rounds
