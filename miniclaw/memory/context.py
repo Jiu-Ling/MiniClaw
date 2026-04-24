@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from miniclaw.memory.files import MemoryFileStore
@@ -18,6 +19,22 @@ _CHARS_PER_TOKEN = 4
 _MAX_MEMORY_SECTION_CHARS = 4000
 
 
+@dataclass(frozen=True, slots=True)
+class MemoryContext:
+    """Structured memory context separating cache-eligible from volatile parts."""
+
+    critical_preferences: list[str] = field(default_factory=list)
+    long_term_facts: list[str] = field(default_factory=list)
+    related_context: str = ""
+
+    def is_empty(self) -> bool:
+        return (
+            not self.critical_preferences
+            and not self.long_term_facts
+            and not self.related_context.strip()
+        )
+
+
 def build_memory_context(
     store: MemoryStore,
     thread_id: str,
@@ -27,25 +44,18 @@ def build_memory_context(
     user_input: str = "",
     memory_token_budget: int = 2000,
     rewrite: "RewriteResult | None" = None,
-) -> str:
+) -> MemoryContext:
     resolved_memory_file = memory_file or getattr(store, "memory_file_store", None)
-    sections: list[str] = []
-
     char_budget = memory_token_budget * _CHARS_PER_TOKEN
-    facts_budget = char_budget // 2
 
-    # 1. Long-term Facts — budget-capped, always resident
+    critical: list[str] = []
+    long_term: list[str] = []
     if resolved_memory_file is not None:
         document = resolved_memory_file.read()
-        if document.long_term_facts:
-            facts_text = "\n".join(
-                ["## Long-term Facts", *[f"- {fact}" for fact in document.long_term_facts]]
-            )
-            if len(facts_text) > facts_budget:
-                facts_text = facts_text[:facts_budget] + "\n...[facts truncated]"
-            sections.append(facts_text)
+        critical = list(document.critical_preferences)
+        long_term = list(document.long_term_facts)
 
-    # 2. Related Context — rewrite-driven retrieval
+    related = ""
     if retriever is not None and user_input:
         intent = rewrite.intent if rewrite is not None else "ambiguous"
         if intent != "new_topic":
@@ -65,9 +75,13 @@ def build_memory_context(
                 else:
                     assembled = [c.content for c in chunks]
                 if assembled:
-                    sections.append("\n".join(["## Related Context", *assembled]))
+                    related = "\n".join(assembled)
 
-    return "\n\n".join(sections)
+    return MemoryContext(
+        critical_preferences=critical,
+        long_term_facts=long_term,
+        related_context=related,
+    )
 
 
 def render_memory_section(memory_context: str) -> str:

@@ -128,16 +128,43 @@ def _validate_plan(plan: dict[str, Any]) -> None:
                 raise ValueError(f"custom role '{role}' requires explicit tools list")
 
 
+def _memory_context_to_str(memory_context: object) -> str:
+    """Transitional: stringify MemoryContext or pass through legacy string."""
+    from miniclaw.memory.context import MemoryContext
+    if memory_context is None:
+        return ""
+    if isinstance(memory_context, MemoryContext):
+        if memory_context.is_empty():
+            return ""
+        parts = []
+        if memory_context.critical_preferences:
+            parts.append(
+                "## Critical Preferences\n"
+                + "\n".join(f"- {p}" for p in memory_context.critical_preferences)
+            )
+        if memory_context.long_term_facts:
+            parts.append(
+                "## Long-term Facts\n"
+                + "\n".join(f"- {f}" for f in memory_context.long_term_facts)
+            )
+        if memory_context.related_context.strip():
+            parts.append("## Related Context\n" + memory_context.related_context.strip())
+        return "\n\n".join(parts)
+    if isinstance(memory_context, str):
+        return memory_context.strip()
+    return ""
+
+
 def _generate_plan(
     provider: ChatProvider,
     state: RuntimeState,
     tool_registry: ToolRegistry | None,
 ) -> dict[str, Any]:
     user_input = str(state.get("user_input", "")).strip()[:500]
-    memory_context = str(state.get("memory_context", "")).strip()[:2000]
+    memory_context_str = _memory_context_to_str(state.get("memory_context"))[:2000]
     user_message = f"Request: {user_input}"
-    if memory_context:
-        user_message += f"\n\nMemory context:\n{memory_context}"
+    if memory_context_str:
+        user_message += f"\n\nMemory context:\n{memory_context_str}"
 
     messages = [
         ChatMessage(role="system", content=_PLANNER_SYSTEM_PROMPT),
@@ -320,7 +347,7 @@ def make_load_context(
                     ),
                 )
 
-        memory_context = ""
+        memory_context: object = None
         if thread_id:
             retrieve_span = safe_start_span(
                 tracer, parent_trace, name="memory.retrieve",
@@ -340,7 +367,7 @@ def make_load_context(
             safe_finish_span(
                 tracer, retrieve_span,
                 status="ok",
-                outputs={"memory_context_chars": len(memory_context)},
+                outputs={"memory_context_chars": len(_memory_context_to_str(memory_context))},
             )
 
         planner_context = ""
