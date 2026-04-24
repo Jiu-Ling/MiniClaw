@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -43,6 +44,7 @@ class MemoryFileStore:
     def __init__(self, path: Path, *, recent_work_limit: int = 3) -> None:
         self.path = Path(path)
         self.recent_work_limit = recent_work_limit
+        self._lock = threading.RLock()
 
     def read(self) -> MemoryDocument:
         if not self.path.is_file():
@@ -60,17 +62,18 @@ class MemoryFileStore:
         long_term_facts: list[str],
         recent_work: dict[str, list[str]],
     ) -> None:
-        document = MemoryDocument(
-            critical_preferences=self._normalize_lines(critical_preferences or []),
-            long_term_facts=self._normalize_lines(long_term_facts),
-            recent_work={
-                thread_id.strip(): self._normalize_lines(entries)[-self.recent_work_limit :]
-                for thread_id, entries in recent_work.items()
-                if thread_id.strip()
-            },
-        )
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(self._render(document), encoding="utf-8")
+        with self._lock:
+            document = MemoryDocument(
+                critical_preferences=self._normalize_lines(critical_preferences or []),
+                long_term_facts=self._normalize_lines(long_term_facts),
+                recent_work={
+                    thread_id.strip(): self._normalize_lines(entries)[-self.recent_work_limit :]
+                    for thread_id, entries in recent_work.items()
+                    if thread_id.strip()
+                },
+            )
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(self._render(document), encoding="utf-8")
 
     def append_recent_work(self, thread_key: str, entry: str) -> None:
         thread_key = thread_key.strip()
@@ -78,31 +81,33 @@ class MemoryFileStore:
         if not thread_key or not entry:
             return
 
-        document = self.read()
-        entries = list(document.recent_work.get(thread_key, []))
-        entries.append(entry)
-        document.recent_work[thread_key] = entries[-self.recent_work_limit :]
-        self.update(
-            critical_preferences=document.critical_preferences,
-            long_term_facts=document.long_term_facts,
-            recent_work=document.recent_work,
-        )
+        with self._lock:
+            document = self.read()
+            entries = list(document.recent_work.get(thread_key, []))
+            entries.append(entry)
+            document.recent_work[thread_key] = entries[-self.recent_work_limit :]
+            self.update(
+                critical_preferences=document.critical_preferences,
+                long_term_facts=document.long_term_facts,
+                recent_work=document.recent_work,
+            )
 
     def merge_long_term_facts(self, facts: list[str]) -> None:
-        document = self.read()
-        merged = list(
-            dict.fromkeys(
-                [
-                    *document.long_term_facts,
-                    *self._normalize_lines(facts),
-                ]
+        with self._lock:
+            document = self.read()
+            merged = list(
+                dict.fromkeys(
+                    [
+                        *document.long_term_facts,
+                        *self._normalize_lines(facts),
+                    ]
+                )
             )
-        )
-        self.update(
-            critical_preferences=document.critical_preferences,
-            long_term_facts=merged,
-            recent_work=document.recent_work,
-        )
+            self.update(
+                critical_preferences=document.critical_preferences,
+                long_term_facts=merged,
+                recent_work=document.recent_work,
+            )
 
     def _parse(self, text: str) -> MemoryDocument:
         critical_preferences: list[str] = []
