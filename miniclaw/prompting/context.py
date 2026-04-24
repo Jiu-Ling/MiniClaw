@@ -12,7 +12,7 @@ from typing import Any
 from miniclaw.capabilities import CapabilityIndexBuilder, render_capability_sections
 from miniclaw.observability.contracts import TraceContext
 from miniclaw.providers.contracts import ChatMessage
-from miniclaw.memory.context import render_memory_section
+from miniclaw.memory.context import MemoryContext
 from miniclaw.skills import SkillsLoader
 from miniclaw.prompting.bootstrap import BootstrapLoader
 from miniclaw.prompting.runtime_metadata import render_runtime_metadata_block
@@ -74,23 +74,38 @@ class ContextBuilder:
         self._last_compression_summary: str = ""
 
     def _build_static_sections(self, state: Mapping[str, Any] | None = None) -> list[str]:
-        """Return prompt sections that are stable within a thread (cache-eligible)."""
+        """Cache-eligible: system prompt + bootstrap + capability + Critical Preferences + Long-term Facts."""
         sections = [self.system_prompt or self._build_default_system_prompt()]
         for bootstrap_file in self.bootstrap_loader.load():
             sections.append(self._format_bootstrap_file(bootstrap_file.name, bootstrap_file.content))
         sections.extend(self._build_capability_sections(state))
+
+        memory_context = self._resolve_memory_context_struct(state)
+        if memory_context.critical_preferences:
+            sections.append(
+                "## Critical Preferences\n"
+                + "\n".join(f"- {p}" for p in memory_context.critical_preferences)
+            )
+        if memory_context.long_term_facts:
+            sections.append(
+                "## Long-term Facts\n"
+                + "\n".join(f"- {f}" for f in memory_context.long_term_facts)
+            )
+
         return [s for s in sections if s]
 
     def _build_dynamic_sections(self, state: Mapping[str, Any] | None = None) -> list[str]:
-        """Return prompt sections that change per turn (not cache-eligible)."""
+        """Volatile: sandbox + Related Context + planner."""
         sections: list[str] = []
         sandbox_section = self._build_sandbox_section(state)
         if sandbox_section:
             sections.append(sandbox_section)
-        memory_context = self._resolve_memory_context(state)
-        memory_section = render_memory_section(memory_context)
-        if memory_section:
-            sections.append(memory_section)
+
+        memory_context = self._resolve_memory_context_struct(state)
+        related = memory_context.related_context.strip()
+        if related:
+            sections.append("## Related Context\n" + related)
+
         sections.extend(self._build_planner_sections(state))
         return [s for s in sections if s]
 
@@ -224,14 +239,15 @@ class ContextBuilder:
         return resolved
 
     @staticmethod
-    def _resolve_memory_context(state: Mapping[str, Any] | None) -> str:
+    def _resolve_memory_context_struct(state: Mapping[str, Any] | None) -> MemoryContext:
         if not isinstance(state, Mapping):
-            return ""
-
+            return MemoryContext()
         memory_context = state.get("memory_context")
-        if isinstance(memory_context, str):
+        if isinstance(memory_context, MemoryContext):
             return memory_context
-        return ""
+        if isinstance(memory_context, str):
+            return MemoryContext(related_context=memory_context)
+        return MemoryContext()
 
     @staticmethod
     def _format_bootstrap_file(name: str, content: str) -> str:

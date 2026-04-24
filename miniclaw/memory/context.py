@@ -11,12 +11,8 @@ if TYPE_CHECKING:
     from miniclaw.memory.retriever import HybridRetriever
     from miniclaw.memory.rewrite import RewriteResult
 
-MEMORY_SECTION_TITLE = "Memory"
-
 # Rough estimate: 1 token ~ 4 chars for mixed Chinese/English
 _CHARS_PER_TOKEN = 4
-
-_MAX_MEMORY_SECTION_CHARS = 4000
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,12 +78,3 @@ def build_memory_context(
         long_term_facts=long_term,
         related_context=related,
     )
-
-
-def render_memory_section(memory_context: str) -> str:
-    memory_context = memory_context.strip()
-    if not memory_context:
-        return ""
-    if len(memory_context) > _MAX_MEMORY_SECTION_CHARS:
-        memory_context = memory_context[:_MAX_MEMORY_SECTION_CHARS] + "\n...[memory truncated]"
-    return f"## {MEMORY_SECTION_TITLE}\n{memory_context}"

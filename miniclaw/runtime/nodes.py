@@ -11,6 +11,7 @@ from miniclaw.utils.async_bridge import run_sync as _run_provider_sync
 from miniclaw.utils.jsonx import safe_loads_with_raw
 
 from miniclaw.memory import build_memory_context
+from miniclaw.memory.context import MemoryContext
 from miniclaw.providers.contracts import ChatMessage, ChatProvider, ChatResponse
 from miniclaw.prompting import ContextBuilder
 from miniclaw.runtime.state import ActiveCapabilities, RuntimeMessage, RuntimeState, RuntimeUsage
@@ -128,40 +129,24 @@ def _validate_plan(plan: dict[str, Any]) -> None:
                 raise ValueError(f"custom role '{role}' requires explicit tools list")
 
 
-def _memory_context_to_str(memory_context: object) -> str:
-    """Transitional: stringify MemoryContext or pass through legacy string."""
-    from miniclaw.memory.context import MemoryContext
-    if memory_context is None:
-        return ""
-    if isinstance(memory_context, MemoryContext):
-        if memory_context.is_empty():
-            return ""
-        parts = []
-        if memory_context.critical_preferences:
-            parts.append(
-                "## Critical Preferences\n"
-                + "\n".join(f"- {p}" for p in memory_context.critical_preferences)
-            )
-        if memory_context.long_term_facts:
-            parts.append(
-                "## Long-term Facts\n"
-                + "\n".join(f"- {f}" for f in memory_context.long_term_facts)
-            )
-        if memory_context.related_context.strip():
-            parts.append("## Related Context\n" + memory_context.related_context.strip())
-        return "\n\n".join(parts)
-    if isinstance(memory_context, str):
-        return memory_context.strip()
-    return ""
-
-
 def _generate_plan(
     provider: ChatProvider,
     state: RuntimeState,
     tool_registry: ToolRegistry | None,
 ) -> dict[str, Any]:
     user_input = str(state.get("user_input", "")).strip()[:500]
-    memory_context_str = _memory_context_to_str(state.get("memory_context"))[:2000]
+    memory_context_obj = state.get("memory_context")
+    memory_context_str = ""
+    if isinstance(memory_context_obj, MemoryContext):
+        if not memory_context_obj.is_empty():
+            parts = []
+            if memory_context_obj.critical_preferences:
+                parts.append("\n".join(f"- {p}" for p in memory_context_obj.critical_preferences))
+            if memory_context_obj.long_term_facts:
+                parts.append("\n".join(f"- {f}" for f in memory_context_obj.long_term_facts))
+            if memory_context_obj.related_context.strip():
+                parts.append(memory_context_obj.related_context.strip())
+            memory_context_str = "\n\n".join(parts)[:2000]
     user_message = f"Request: {user_input}"
     if memory_context_str:
         user_message += f"\n\nMemory context:\n{memory_context_str}"
@@ -367,7 +352,11 @@ def make_load_context(
             safe_finish_span(
                 tracer, retrieve_span,
                 status="ok",
-                outputs={"memory_context_chars": len(_memory_context_to_str(memory_context))},
+                outputs={"memory_context_chars": (
+                    len(memory_context.related_context)
+                    + sum(len(p) for p in memory_context.critical_preferences)
+                    + sum(len(f) for f in memory_context.long_term_facts)
+                ) if isinstance(memory_context, MemoryContext) else 0},
             )
 
         planner_context = ""
