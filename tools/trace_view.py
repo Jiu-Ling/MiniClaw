@@ -111,22 +111,28 @@ def _new_trace(tid: str, rec: dict[str, Any]) -> dict[str, Any]:
 
 
 def _new_span(rec: dict[str, Any]) -> dict[str, Any]:
-    return {
+    md = dict(rec.get("metadata") or {})
+    name = rec.get("name") or ""
+    span: dict[str, Any] = {
         "span_id": rec.get("span_id") or "",
         "parent_span_id": rec.get("parent_span_id"),
-        "name": rec.get("name") or "",
-        "kind_prefix": kind_prefix(rec.get("name") or ""),
+        "name": name,
+        "kind_prefix": kind_prefix(name),
         "start_ts": rec.get("timestamp"),
         "end_ts": None,
         "duration_ms": None,
         "status": None,
-        "start_metadata": dict(rec.get("metadata") or {}),
+        "start_metadata": md,
         "end_metadata": {},
         "payload": dict(rec.get("payload") or {}),
         "output": {},
         "children": [],
         "events": [],
     }
+    if name.startswith("tool."):
+        span["tool_source"] = md.get("tool.source", "")
+        span["tool_name"] = md.get("tool.name", "")
+    return span
 
 
 def build_traces(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -213,6 +219,10 @@ def compute_stats(trace: dict[str, Any]) -> dict[str, Any]:
     subagent_count = 0
     error_count = 0
     running_count = 0
+    cache_calls = 0
+    cache_prompt_total = 0
+    cache_cached_total = 0
+    cache_creation_total = 0
 
     for s in spans:
         merged_meta = {**s.get("start_metadata", {}), **s.get("end_metadata", {})}
@@ -234,6 +244,18 @@ def compute_stats(trace: dict[str, Any]) -> dict[str, Any]:
         if s.get("status") is None:
             running_count += 1
 
+        for event in s.get("events", []):
+            if event.get("name") == "prompt.cache.usage":
+                payload = event.get("payload") or {}
+                pt = int(payload.get("prompt_tokens", 0) or 0)
+                ct = int(payload.get("cached_tokens", 0) or 0)
+                cct = int(payload.get("cache_creation_tokens", 0) or 0)
+                if pt > 0:
+                    cache_calls += 1
+                    cache_prompt_total += pt
+                    cache_cached_total += ct
+                    cache_creation_total += cct
+
     return {
         "span_count": len(spans),
         "error_count": error_count,
@@ -244,6 +266,11 @@ def compute_stats(trace: dict[str, Any]) -> dict[str, Any]:
         "models_used": sorted(models_used),
         "fleet_count": len(fleet_ids),
         "subagent_count": subagent_count,
+        "cache_calls": cache_calls,
+        "cache_prompt_tokens": cache_prompt_total,
+        "cache_cached_tokens": cache_cached_total,
+        "cache_creation_tokens": cache_creation_total,
+        "cache_hit_rate": (cache_cached_total / cache_prompt_total) if cache_prompt_total > 0 else 0.0,
     }
 
 
@@ -412,6 +439,7 @@ section.tree .tag.role-executor  { color: var(--role-e); }
 section.tree .tag.role-reviewer  { color: var(--role-v); }
 section.tree .tag.model  { color: var(--span-agent); }
 section.tree .tag.tokens { color: var(--span-prov); }
+section.tree .tool-source-badge { display: inline-block; padding: 0 6px; margin-left: 6px; background: var(--bg-chip-2); color: var(--fg-muted); border-radius: 8px; font-size: 9px; text-transform: uppercase; letter-spacing: 0.5px; }
 section.tree .children { margin-left: 16px; border-left: 1px dashed var(--border); padding-left: 4px; }
 section.tree .span-node.hidden { display: none; }
 section.tree .event-row { padding: 2px 6px 2px 22px; font-size: 11px; color: var(--span-event); font-family: "JetBrains Mono", monospace; }
@@ -723,6 +751,9 @@ function renderSummary(trace) {
   if (s.models_used.length) {
     parts.push(`<div class="metric"><span class="label">models</span><span class="val">${s.models_used.join(", ")}</span></div>`);
   }
+  if (s.cache_calls > 0) {
+    parts.push(`<div class="metric"><span class="label">cache</span><span class="val">${s.cache_calls} calls, ${(s.cache_hit_rate * 100).toFixed(1)}% hit (${formatTokens(s.cache_cached_tokens)}/${formatTokens(s.cache_prompt_tokens)} tok)</span></div>`);
+  }
   document.getElementById("summary-bar").innerHTML = parts.join("");
 }
 
@@ -830,6 +861,7 @@ function renderSpanNode(span, trace) {
     }),
     el("span", { class: "status-icon " + icon.cls, text: icon.text }),
     el("span", { class: "span-name prefix-" + prefix, text: span.name }),
+    ...(span.tool_source ? [el("span", { class: "tool-source-badge", text: span.tool_source })] : []),
     ...memorySpanSummary(span).map(s => el("span", { class: "span-tag dim", text: s })),
     ...tags.map(t => el("span", { class: t.cls, text: t.text })),
     el("span", { class: "span-duration", text: formatDuration(span.duration_ms) }),
