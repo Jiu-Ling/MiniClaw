@@ -101,6 +101,19 @@ def _strip_cache_control(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     return cleaned
 
 
+def _inject_tools_cache_control(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Mark the LAST tool with cache_control: ephemeral. Returns a new list.
+
+    Anthropic caches the entire tools array up to and including the marked tool.
+    Marking only the last entry covers the whole list.
+    """
+    if not tools:
+        return tools
+    cleaned = [dict(t) for t in tools]
+    cleaned[-1] = {**cleaned[-1], "cache_control": {"type": "ephemeral"}}
+    return cleaned
+
+
 def _parse_usage(usage_source: Any) -> ChatUsage:
     details = _value(usage_source, "prompt_tokens_details", None)
     cached_tokens = None
@@ -149,7 +162,10 @@ class OpenAICompatibleProvider(ChatProvider):
             request_messages = _strip_cache_control(request_messages)
         kwargs: dict[str, Any] = {"model": model or self.model, "messages": request_messages}
         if tools:
-            kwargs["tools"] = list(tools)
+            tool_list = list(tools)
+            if self.cache_strategy == "anthropic":
+                tool_list = _inject_tools_cache_control(tool_list)
+            kwargs["tools"] = tool_list
         response = await self._client.chat.completions.create(**kwargs)
 
         response_data = _dump(response)
@@ -233,7 +249,10 @@ class OpenAICompatibleProvider(ChatProvider):
             "stream": True,
         }
         if tools:
-            kwargs["tools"] = list(tools)
+            tool_list = list(tools)
+            if self.cache_strategy == "anthropic":
+                tool_list = _inject_tools_cache_control(tool_list)
+            kwargs["tools"] = tool_list
         stream = await self._client.chat.completions.create(**kwargs)
 
         async for chunk in stream:
