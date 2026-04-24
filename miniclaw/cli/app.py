@@ -110,69 +110,65 @@ def memory_rebuild(
 def trace_tail(
     path: Path = typer.Argument(..., help="Trace JSONL file path"),
     follow: bool = typer.Option(True, "--follow/--no-follow"),
+    tool: str | None = typer.Option(None, "--tool", help="Filter to tool.<name> spans (exact name after 'tool.' prefix)."),
+    kind: str | None = typer.Option(None, "--kind", help="Filter by kind(s), comma-separated (e.g. span_finish,event)."),
+    min_ms: int = typer.Option(0, "--min-ms", help="Only show spans whose duration is >= N ms."),
+    status: str | None = typer.Option(None, "--status", help="Filter by status value (e.g. ok, error)."),
+    color: bool = typer.Option(True, "--color/--no-color", help="Enable or disable colored output."),
 ) -> None:
-    """Pretty-print a trace JSONL file with hierarchical indentation."""
+    """Pretty-print a trace JSONL file with duration, tool args, cache stats, and filters."""
+    import sys
     import time
+
+    from miniclaw.cli.trace_renderer import SpanState, format_record
 
     if not path.exists():
         typer.echo(f"trace file not found: {path}", err=True)
         raise typer.Exit(1)
 
-    span_depth: dict[str, int] = {}
+    # Disable color when stdout is not a TTY
+    use_color = color and sys.stdout.isatty()
 
-    def _depth_for(rec: dict) -> int:
-        kind = rec.get("kind", "")
-        span_id = rec.get("span_id") or ""
-        parent = rec.get("parent_span_id")
-        if parent and parent in span_depth:
-            return span_depth[parent] + 1
-        if kind == "run_start":
-            return 0
-        return span_depth.get(span_id, 0)
+    # Parse filter sets
+    kind_filter: set[str] | None = None
+    if kind:
+        kind_filter = {k.strip() for k in kind.split(",") if k.strip()}
 
-    def _print_record(rec: dict) -> None:
-        kind = rec.get("kind", "")
-        name = rec.get("name", "")
-        span_id = rec.get("span_id") or ""
-        depth = _depth_for(rec)
-        if kind in ("run_start", "span_start"):
-            span_depth[span_id] = depth
-        prefix = "  " * depth
-        marker = {
-            "run_start": "▶",
-            "run_finish": "■",
-            "span_start": "├",
-            "span_finish": "└",
-            "event": "•",
-        }.get(kind, "·")
-        status = rec.get("status", "")
-        suffix = f" [{status}]" if status else ""
-        typer.echo(f"{prefix}{marker} {name}{suffix}")
+    span_state: dict[str, SpanState] = {}
+
+    def _process_line(raw: str) -> None:
+        raw = raw.strip()
+        if not raw:
+            return
+        parsed = safe_loads(raw)
+        if not isinstance(parsed, dict):
+            return
+        line = format_record(
+            parsed,
+            span_state,
+            color=use_color,
+            min_ms=min_ms,
+            tool_filter=tool,
+            kind_filter=kind_filter,
+            status_filter=status,
+        )
+        if line is not None:
+            typer.echo(line)
 
     with path.open("r") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            parsed = safe_loads(line)
-            if parsed is None:
-                continue
-            _print_record(parsed)
+        for raw_line in fh:
+            _process_line(raw_line)
 
         if not follow:
             return
 
         try:
             while True:
-                line = fh.readline()
-                if not line:
+                raw_line = fh.readline()
+                if not raw_line:
                     time.sleep(0.2)
                     continue
-                line = line.strip()
-                if line:
-                    parsed = safe_loads(line)
-                    if parsed is not None:
-                        _print_record(parsed)
+                _process_line(raw_line)
         except KeyboardInterrupt:
             return
 
