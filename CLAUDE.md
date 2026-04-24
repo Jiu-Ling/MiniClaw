@@ -85,6 +85,12 @@ Builtin tools in `tools/builtin/`: filesystem, shell, web search, cron, spawn_su
 
 Hybrid retrieval: FTS5 (BM25) + sqlite-vec (BGE-M3 1024-dim embeddings via Ollama) fused with RRF. Components: `retriever.py` (search), `indexer.py` (ingest), `chunker.py` (splitting), `embedding.py` (Ollama client), `context.py` (compression with dual trigger: 30K chars + 20 messages).
 
+**Schema (2-section layout, Phase 0):**
+- `MEMORY.md` stores 2 sections: `## Critical Preferences` (stable user preferences, capped per `memory_critical_facts_max`) and `## Long-term Facts` (project facts). Per-thread narratives live in `.miniclaw/memory/daily/YYYY-MM-DD.md`, indexed by FTS5+vec, retrievable via `memory_search`.
+- `MemoryFileStore` is the single authoritative reader/writer for `MEMORY.md`. Concurrent writes are serialized via `threading.RLock` (in-process; miniclaw is single-process).
+- `MemoryFileStore.append_to_daily_journal(thread_id, narrative, source)` is the single entry point for daily MD writes; consolidation and (in Phase 5) compression promotion both call it.
+- The legacy `## Recent Work` section was removed in Phase 0 — daily MD is the canonical source for narratives.
+
 ### MCP Integration (`miniclaw/mcp/`)
 
 MCP server registry with stdio/SSE adapters. Config-driven (`mcp/config.py`), tools exposed through the main tool registry.
