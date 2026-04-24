@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 
 from openai import AsyncOpenAI
 
@@ -70,27 +70,35 @@ def _normalize_content_parts(content: Any) -> tuple[str, list[dict[str, Any]]]:
     return "", [normalized] if isinstance(normalized, dict) else []
 
 
-def _serialize_message(message: ChatMessage, *, cache_control: bool = False) -> dict[str, Any]:
+def _serialize_message(message: ChatMessage) -> dict[str, Any]:
     payload: dict[str, Any] = {"role": message.role}
     if message.name is not None:
         payload["name"] = message.name
     if message.tool_call_id is not None:
         payload["tool_call_id"] = message.tool_call_id
     if message.content_parts:
-        parts = [dict(part) for part in message.content_parts]
-        if cache_control and parts:
-            parts[-1] = {**parts[-1], "cache_control": {"type": "ephemeral"}}
-        payload["content"] = parts
+        payload["content"] = [dict(part) for part in message.content_parts]
     elif message.content is not None or message.tool_calls:
-        if cache_control and message.content:
-            payload["content"] = [
-                {"type": "text", "text": message.content, "cache_control": {"type": "ephemeral"}}
-            ]
-        else:
-            payload["content"] = message.content
+        payload["content"] = message.content
     if message.tool_calls:
         payload["tool_calls"] = [_normalize_value(call) for call in message.tool_calls]
     return payload
+
+
+def _strip_cache_control(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a new message list with `cache_control` removed from any content parts."""
+    cleaned = []
+    for msg in messages:
+        new_msg = dict(msg)
+        content = new_msg.get("content")
+        if isinstance(content, list):
+            new_msg["content"] = [
+                {k: v for k, v in part.items() if k != "cache_control"}
+                if isinstance(part, dict) else part
+                for part in content
+            ]
+        cleaned.append(new_msg)
+    return cleaned
 
 
 def _parse_usage(usage_source: Any) -> ChatUsage:
@@ -119,13 +127,13 @@ class OpenAICompatibleProvider(ChatProvider):
         base_url: str,
         model: str,
         supports_vision: bool = False,
-        enable_prompt_cache: bool = False,
+        cache_strategy: Literal["anthropic", "openai_auto", "none"] = "none",
         client: AsyncOpenAI | None = None,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url
         self.model = model
-        self.enable_prompt_cache = enable_prompt_cache
+        self.cache_strategy = cache_strategy
         self.capabilities = ProviderCapabilities(vision=supports_vision)
         self._client = client or AsyncOpenAI(api_key=api_key, base_url=base_url)
 
@@ -136,14 +144,9 @@ class OpenAICompatibleProvider(ChatProvider):
         model: str | None = None,
         tools: Sequence[dict[str, Any]] | None = None,
     ) -> ChatResponse:
-        first_system_seen = False
-        request_messages = []
-        for msg in messages:
-            apply_cache = False
-            if self.enable_prompt_cache and msg.role == "system" and not first_system_seen:
-                apply_cache = True
-                first_system_seen = True
-            request_messages.append(_serialize_message(msg, cache_control=apply_cache))
+        request_messages = [_serialize_message(m) for m in messages]
+        if self.cache_strategy != "anthropic":
+            request_messages = _strip_cache_control(request_messages)
         kwargs: dict[str, Any] = {"model": model or self.model, "messages": request_messages}
         if tools:
             kwargs["tools"] = list(tools)
@@ -221,7 +224,9 @@ class OpenAICompatibleProvider(ChatProvider):
         model: str | None = None,
         tools: Sequence[dict[str, Any]] | None = None,
     ) -> AsyncIterator[str]:
-        request_messages = [_serialize_message(message) for message in messages]
+        request_messages = [_serialize_message(m) for m in messages]
+        if self.cache_strategy != "anthropic":
+            request_messages = _strip_cache_control(request_messages)
         kwargs: dict[str, Any] = {
             "model": model or self.model,
             "messages": request_messages,
