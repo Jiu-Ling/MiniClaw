@@ -1,12 +1,12 @@
-"""Pure rendering helpers for `miniclaw trace tail`.
+"""Pure rendering helpers for `miniclaw trace tail` and `miniclaw trace summary`.
 
 No file I/O, no typer — only stdlib so these functions are easily unit-tested.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterable
 
 
 # ---------------------------------------------------------------------------
@@ -342,3 +342,200 @@ def _render_event(
     status: str = metadata.get("status") or ""
     suffix = f" [{status}]" if status else ""
     return f"{ts_pfx}  {indent}{colored_marker} {name}{suffix}"
+
+
+# ---------------------------------------------------------------------------
+# Aggregation data types
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ToolStat:
+    count: int = 0
+    total_ms: float = 0.0
+    max_ms: float = 0.0
+
+    @property
+    def avg_ms(self) -> float:
+        return self.total_ms / self.count if self.count else 0.0
+
+
+@dataclass
+class SpanStat:
+    count: int = 0
+    total_ms: float = 0.0
+    errors: int = 0
+
+
+@dataclass
+class CacheStat:
+    calls: int = 0
+    total_prompt: int = 0
+    total_cached: int = 0
+
+    @property
+    def hit_rate(self) -> float:
+        return self.total_cached / self.total_prompt if self.total_prompt else 0.0
+
+
+@dataclass
+class ErrorEntry:
+    name: str
+    count: int = 0
+    sample_msg: str = ""
+
+
+@dataclass
+class TraceSummary:
+    runs: int = 0
+    spans_ok: int = 0
+    spans_err: int = 0
+    events: int = 0
+    tools: dict[str, ToolStat] = field(default_factory=dict)
+    spans: dict[str, SpanStat] = field(default_factory=dict)
+    cache: CacheStat = field(default_factory=CacheStat)
+    errors: dict[str, ErrorEntry] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Aggregation logic
+# ---------------------------------------------------------------------------
+
+
+def aggregate_trace(records: Iterable[dict]) -> TraceSummary:
+    """Walk JSONL records and return aggregate stats."""
+    summary = TraceSummary()
+    open_spans: dict[str, dict] = {}  # span_id -> start record
+
+    for rec in records:
+        kind = rec.get("kind", "")
+        if kind == "run_start":
+            summary.runs += 1
+        elif kind == "span_start":
+            sid = rec.get("span_id")
+            if sid:
+                open_spans[sid] = rec
+        elif kind == "span_finish":
+            sid = rec.get("span_id")
+            start = open_spans.pop(sid, None) if sid else None
+            duration_ms = _duration_ms(start, rec) if start else 0.0
+            name = rec.get("name", "")
+            status = rec.get("status", "")
+
+            if status == "error":
+                summary.spans_err += 1
+                err_msg = _extract_error_msg(rec)
+                err = summary.errors.setdefault(name, ErrorEntry(name=name))
+                err.count += 1
+                if not err.sample_msg and err_msg:
+                    err.sample_msg = err_msg
+            else:
+                summary.spans_ok += 1
+
+            stat = summary.spans.setdefault(name, SpanStat())
+            stat.count += 1
+            stat.total_ms += duration_ms
+            if status == "error":
+                stat.errors += 1
+
+            if name.startswith("tool.") or name.startswith("tool.call."):
+                tool_name = (rec.get("metadata") or {}).get("tool.name") or name.split(".", 1)[-1]
+                tstat = summary.tools.setdefault(tool_name, ToolStat())
+                tstat.count += 1
+                tstat.total_ms += duration_ms
+                tstat.max_ms = max(tstat.max_ms, duration_ms)
+        elif kind == "event":
+            summary.events += 1
+            if rec.get("name") == "prompt.cache.usage":
+                payload = rec.get("payload") or {}
+                pt = int(payload.get("prompt_tokens") or 0)
+                ct = int(payload.get("cached_tokens") or 0)
+                if pt > 0:
+                    summary.cache.calls += 1
+                    summary.cache.total_prompt += pt
+                    summary.cache.total_cached += ct
+
+    return summary
+
+
+def _duration_ms(start: dict, finish: dict) -> float:
+    """Compute milliseconds between start and finish ISO timestamps."""
+    try:
+        start_ts = parse_iso_ts(start.get("timestamp", ""))
+        finish_ts = parse_iso_ts(finish.get("timestamp", ""))
+        return max(0.0, (finish_ts - start_ts).total_seconds() * 1000.0)
+    except Exception:
+        return 0.0
+
+
+def _extract_error_msg(rec: dict) -> str:
+    """Pull first non-empty error string from finish record's output or metadata."""
+    output = rec.get("output") or {}
+    md = rec.get("metadata") or {}
+    for source in (output, md):
+        for k in ("error", "message", "reason"):
+            v = source.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()[:80]
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Summary renderer
+# ---------------------------------------------------------------------------
+
+
+def render_summary(summary: TraceSummary, *, top_n: int = 10) -> str:
+    """Render the summary as a multi-line string for terminal display."""
+    lines: list[str] = []
+
+    total_spans = summary.spans_ok + summary.spans_err
+    lines.append("Trace summary:")
+    lines.append(f"  Runs:    {summary.runs}")
+    lines.append(f"  Spans:   {total_spans}  ({summary.spans_ok} ok, {summary.spans_err} error)")
+    lines.append(f"  Events:  {summary.events}")
+
+    if summary.tools:
+        lines.append("")
+        lines.append("Top tools by count:")
+        ranked_tools = sorted(summary.tools.items(), key=lambda x: x[1].count, reverse=True)[:top_n]
+        name_w = max(len(n) for n, _ in ranked_tools) + 2
+        for name, stat in ranked_tools:
+            lines.append(
+                f"  {name:<{name_w}}{stat.count:>3}  "
+                f"total {format_duration(stat.total_ms):<8}"
+                f"avg {format_duration(stat.avg_ms):<8}"
+                f"max {format_duration(stat.max_ms)}"
+            )
+
+    if summary.spans:
+        lines.append("")
+        lines.append("Top spans by total duration:")
+        ranked_spans = sorted(summary.spans.items(), key=lambda x: x[1].total_ms, reverse=True)[:top_n]
+        name_w = max(len(n) for n, _ in ranked_spans) + 2
+        for name, stat in ranked_spans:
+            call_label = "call" if stat.count == 1 else "calls"
+            lines.append(
+                f"  {name:<{name_w}}{format_duration(stat.total_ms):<8}"
+                f"({stat.count} {call_label})"
+            )
+
+    if summary.cache.calls > 0:
+        rate_pct = summary.cache.hit_rate * 100
+        lines.append("")
+        lines.append("Cache:")
+        lines.append(f"  Calls:           {summary.cache.calls}")
+        lines.append(f"  Avg hit rate:    {rate_pct:.1f}%")
+        lines.append(f"  Total prompt:    {summary.cache.total_prompt:,} tokens")
+        lines.append(f"  Total cached:    {summary.cache.total_cached:,} tokens")
+
+    if summary.errors:
+        lines.append("")
+        lines.append(f"Errors ({summary.spans_err}):")
+        ranked_errors = sorted(summary.errors.items(), key=lambda x: x[1].count, reverse=True)[:top_n]
+        name_w = max(len(n) for n, _ in ranked_errors) + 2
+        for name, e in ranked_errors:
+            sample = f"  ('{e.sample_msg}')" if e.sample_msg else ""
+            lines.append(f"  {name:<{name_w}}{e.count}{sample}")
+
+    return "\n".join(lines) + "\n"

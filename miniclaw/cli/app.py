@@ -173,6 +173,32 @@ def trace_tail(
             return
 
 
+@trace_app.command("summary")
+def trace_summary(
+    path: Path = typer.Argument(..., help="Trace JSONL file path"),
+    top_n: int = typer.Option(10, "--top-n", help="Top N entries per category"),
+) -> None:
+    """Aggregate stats from a trace JSONL file: tools, spans, cache, errors."""
+    from miniclaw.cli.trace_renderer import aggregate_trace, render_summary
+
+    if not path.exists():
+        typer.echo(f"trace file not found: {path}", err=True)
+        raise typer.Exit(1)
+
+    def _records():
+        with path.open("r") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                parsed = safe_loads(line)
+                if isinstance(parsed, dict):
+                    yield parsed
+
+    summary = aggregate_trace(_records())
+    typer.echo(render_summary(summary, top_n=top_n))
+
+
 @app.callback()
 def main() -> None:
     """MiniClaw runtime CLI."""
