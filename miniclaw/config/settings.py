@@ -123,7 +123,14 @@ class Settings(BaseSettings):
     memory_consolidation_trigger_threshold: int = 3
     memory_critical_facts_max: int = 12
 
-    # Prompt caching (DashScope cache_control: ephemeral)
+    # Prompt caching strategy.
+    # "auto" → bootstrap detects from base_url (anthropic/dashscope → "anthropic",
+    #          openai → "openai_auto", unknown → "none").
+    # Explicit values bypass detection.
+    cache_strategy: Literal["auto", "anthropic", "openai_auto", "none"] = "auto"
+
+    # DEPRECATED: use cache_strategy instead. Removed in a future release.
+    # When True (and cache_strategy is "auto"), bootstrap maps to "anthropic".
     enable_prompt_cache: bool = False
 
     # Mini model — shared by classify intent + heartbeat judgment

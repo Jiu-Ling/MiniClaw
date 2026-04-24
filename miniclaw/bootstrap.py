@@ -52,6 +52,29 @@ if TYPE_CHECKING:
 
 
 
+def _resolve_cache_strategy(
+    *,
+    base_url: str,
+    explicit: str,
+    enable_legacy_prompt_cache: bool,
+) -> str:
+    """Resolve the effective cache_strategy from settings + base_url.
+
+    Order: explicit (non-"auto") wins; otherwise auto-detect from base_url;
+    fall back to "anthropic" if legacy flag set; else "none".
+    """
+    if explicit != "auto":
+        return explicit
+    url = (base_url or "").lower()
+    if "anthropic.com" in url or "dashscope" in url:
+        return "anthropic"
+    if "openai.com" in url:
+        return "openai_auto"
+    if enable_legacy_prompt_cache:
+        return "anthropic"
+    return "none"
+
+
 def build_settings() -> Settings:
     return Settings()
 
@@ -213,11 +236,25 @@ def build_thread_control_store(sqlite_path: Path | None = None) -> SQLiteThreadC
 
 def build_provider(settings: Settings | None = None) -> OpenAICompatibleProvider:
     resolved_settings = settings or build_settings()
+    cache_strategy = _resolve_cache_strategy(
+        base_url=resolved_settings.base_url,
+        explicit=resolved_settings.cache_strategy,
+        enable_legacy_prompt_cache=resolved_settings.enable_prompt_cache,
+    )
+    if resolved_settings.enable_prompt_cache and resolved_settings.cache_strategy == "auto":
+        import warnings
+        warnings.warn(
+            "MINICLAW_ENABLE_PROMPT_CACHE is deprecated; "
+            "set MINICLAW_CACHE_STRATEGY=anthropic explicitly. "
+            "This setting will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     return OpenAICompatibleProvider(
         api_key=resolved_settings.api_key,
         base_url=resolved_settings.base_url,
         model=resolved_settings.model,
-        enable_prompt_cache=resolved_settings.enable_prompt_cache,
+        cache_strategy=cache_strategy,
     )
 
 
