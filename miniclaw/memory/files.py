@@ -83,6 +83,7 @@ class MemoryFileStore:
         entries.append(entry)
         document.recent_work[thread_key] = entries[-self.recent_work_limit :]
         self.update(
+            critical_preferences=document.critical_preferences,
             long_term_facts=document.long_term_facts,
             recent_work=document.recent_work,
         )
@@ -97,7 +98,11 @@ class MemoryFileStore:
                 ]
             )
         )
-        self.update(long_term_facts=merged, recent_work=document.recent_work)
+        self.update(
+            critical_preferences=document.critical_preferences,
+            long_term_facts=merged,
+            recent_work=document.recent_work,
+        )
 
     def _parse(self, text: str) -> MemoryDocument:
         critical_preferences: list[str] = []
