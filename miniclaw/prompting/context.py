@@ -14,7 +14,7 @@ from miniclaw.capabilities import CapabilityIndexBuilder, render_capability_sect
 from miniclaw.observability.contracts import TraceContext
 from miniclaw.providers.contracts import ChatMessage
 from miniclaw.memory.context import MemoryContext
-from miniclaw.memory.extract import extract_pinned_references
+from miniclaw.memory.extract import PinnedReferences, extract_pinned_references
 from miniclaw.skills import SkillsLoader
 from miniclaw.prompting.bootstrap import BootstrapLoader
 from miniclaw.prompting.runtime_metadata import render_runtime_metadata_block
@@ -63,6 +63,7 @@ class ContextBuilder:
         compress_turn_summary_chars: int | None = None,
         max_history_messages: int | None = None,
         on_compression: Callable[[Any], None] | None = None,
+        pinned_extract_enabled: bool = True,
     ) -> None:
         self.workspace = Path(workspace) if workspace is not None else self._default_workspace()
         self.bootstrap_loader = bootstrap_loader or BootstrapLoader(workspace=self.workspace)
@@ -75,6 +76,7 @@ class ContextBuilder:
         self.compress_turn_summary_chars = compress_turn_summary_chars or _DEFAULT_TURN_SUMMARY_CHARS
         self.max_history_messages = max_history_messages or _DEFAULT_MAX_HISTORY_MESSAGES
         self.on_compression = on_compression
+        self.pinned_extract_enabled = pinned_extract_enabled
         self._last_compression_summary: str = ""
 
     def _build_static_sections(self, state: Mapping[str, Any] | None = None) -> list[str]:
@@ -200,6 +202,7 @@ class ContextBuilder:
                 max_history_messages=self.max_history_messages,
                 on_compression=self.on_compression,
                 thread_id=str(self._resolve_runtime_metadata(state).get("thread_id", "")),
+                pinned_extract_enabled=self.pinned_extract_enabled,
             )
 
             messages = self._apply_message_cache_breakpoints(messages)
@@ -558,6 +561,7 @@ def _trim_history(
     max_history_messages: int = _DEFAULT_MAX_HISTORY_MESSAGES,
     on_compression: Callable[[Any], None] | None = None,
     thread_id: str = "",
+    pinned_extract_enabled: bool = True,
 ) -> tuple[list[ChatMessage], str]:
     """Compress old conversation turns when history exceeds limits.
 
@@ -599,10 +603,14 @@ def _trim_history(
 
     compression_summary = "\n".join(summary_lines)
 
-    pinned = extract_pinned_references(
-        msg for exchange in old_exchanges for msg in exchange
-    )
-    pinned_section = pinned.render_markdown()
+    if pinned_extract_enabled:
+        pinned = extract_pinned_references(
+            msg for exchange in old_exchanges for msg in exchange
+        )
+        pinned_section = pinned.render_markdown()
+    else:
+        pinned = PinnedReferences()
+        pinned_section = ""
 
     summary_body = (
         "[Compressed conversation history]\n"

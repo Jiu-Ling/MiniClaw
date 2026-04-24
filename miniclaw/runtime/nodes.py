@@ -450,6 +450,7 @@ def make_agent(
     on_event: Callable[[dict[str, Any]], None] | None = None,
     tracer: "Tracer | None" = None,
     on_compression: Callable[[Any], None] | None = None,
+    pinned_extract_enabled: bool = True,
 ) -> Callable[[RuntimeState], RuntimeState]:
     from miniclaw.observability.contracts import NoopTracer, build_run_context
     resolved_tracer = tracer or NoopTracer()
@@ -462,6 +463,7 @@ def make_agent(
         history_char_budget=settings.history_char_budget,
         max_history_messages=settings.max_history_messages,
         on_compression=on_compression,
+        pinned_extract_enabled=pinned_extract_enabled,
     )
 
     max_rounds = settings.max_tool_rounds

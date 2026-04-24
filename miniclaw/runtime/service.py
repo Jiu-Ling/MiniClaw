@@ -258,6 +258,7 @@ class RuntimeService:
             memory_token_budget=self.settings.memory_token_budget,
             tracer=self.tracer,
             on_compression=self._on_compression,
+            pinned_extract_enabled=self.settings.compression_pinned_extract_enabled,
         )
         app = graph.compile(checkpointer=self._checkpointer)
         config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
@@ -385,6 +386,7 @@ class RuntimeService:
             on_event=on_event,
             tracer=self.tracer,
             on_compression=self._on_compression,
+            pinned_extract_enabled=self.settings.compression_pinned_extract_enabled,
         )
         app = graph.compile(checkpointer=self._checkpointer)
         config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}

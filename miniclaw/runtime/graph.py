@@ -147,6 +147,7 @@ def build_graph(
     on_event: Callable[[dict[str, Any]], None] | None = None,
     tracer: "Tracer | None" = None,
     on_compression: "Callable[[Any], None] | None" = None,
+    pinned_extract_enabled: bool = True,
 ) -> StateGraph:
     graph = StateGraph(RuntimeState)
     resolved_tracer = tracer or NoopTracer()
@@ -187,6 +188,7 @@ def build_graph(
             on_event=on_event,
             tracer=tracer,
             on_compression=on_compression,
+            pinned_extract_enabled=pinned_extract_enabled,
         ),
     ))
     graph.add_node("error_handler", wrap("error_handler", error_handler))
