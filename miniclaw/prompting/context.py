@@ -13,6 +13,7 @@ from miniclaw.capabilities import CapabilityIndexBuilder, render_capability_sect
 from miniclaw.observability.contracts import TraceContext
 from miniclaw.providers.contracts import ChatMessage
 from miniclaw.memory.context import MemoryContext
+from miniclaw.memory.extract import extract_pinned_references
 from miniclaw.skills import SkillsLoader
 from miniclaw.prompting.bootstrap import BootstrapLoader
 from miniclaw.prompting.runtime_metadata import render_runtime_metadata_block
@@ -576,14 +577,23 @@ def _trim_history(
 
     compression_summary = "\n".join(summary_lines)
 
+    pinned = extract_pinned_references(
+        msg for exchange in old_exchanges for msg in exchange
+    )
+    pinned_section = pinned.render_markdown()
+
+    summary_body = (
+        "[Compressed conversation history]\n"
+        "The following is a summary of earlier conversation turns:\n\n"
+        f"{compression_summary}\n"
+    )
+    if pinned_section:
+        summary_body += f"\n{pinned_section}\n"
+    summary_body += "\n[End of compressed history — recent messages follow]"
+
     summary_msg = ChatMessage(
         role="assistant",
-        content=(
-            "[Compressed conversation history]\n"
-            "The following is a summary of earlier conversation turns:\n\n"
-            f"{compression_summary}\n\n"
-            "[End of compressed history — recent messages follow]"
-        ),
+        content=summary_body,
     )
 
     recent_msgs: list[ChatMessage] = []
