@@ -3,15 +3,18 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from miniclaw.config.settings import Settings
+from miniclaw.runtime import RuntimeService
+
 
 @dataclass(frozen=True)
 class CommandContext:
     thread_id: str
     channel: str
-    settings: object | None = None
-    runtime_service: object | None = None
+    settings: Settings | None = None
+    runtime_service: RuntimeService | None = None
     args: str = ""  # text after the command name
-    registry: object | None = None  # CommandRegistry ref for help command
+    registry: CommandRegistry | None = None  # CommandRegistry ref for help command
 
 
 @dataclass(frozen=True)
@@ -78,5 +81,5 @@ class CommandRegistry:
             aliases = ""
             if meta.aliases:
                 aliases = f" (alias: {', '.join('/' + a for a in meta.aliases)})"
-            lines.append(f"/{meta.name} — {meta.description}{aliases}")
+            lines.append(f"/{meta.name} — {meta.description}{aliases} \n")
         return "\n".join(lines)
