@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -147,7 +146,18 @@ async def llm_consolidate(
         recent_work=new_recent,
     )
     if daily_dir is not None:
-        _write_daily(daily_dir, thread_id, narrative, indexer)
+        # Indexer is consolidation's concern, kept out of MemoryFileStore.
+        journal_store = MemoryFileStore(memory_path, daily_dir=daily_dir)
+        written = journal_store.append_to_daily_journal(
+            thread_id=thread_id,
+            narrative=narrative,
+            source="consolidation",
+        )
+        if indexer is not None:
+            try:
+                indexer.mark_dirty(written.name)
+            except Exception:
+                pass
     return ConsolidationResult(
         thread_narrative=narrative, facts_added=added, facts_updated=updated,
         facts_skipped=skipped, facts_critical=n_crit, confidence=confidence,
@@ -171,21 +181,6 @@ def regex_consolidate_fallback(*, thread_id: str, memory_path: Path, digests: li
 
 
 # --- Helpers --------------------------------------------------------------
-
-def _write_daily(daily_dir: Path, thread_id: str, narrative: str, indexer: MemoryIndexer | None) -> None:
-    daily_dir.mkdir(parents=True, exist_ok=True)
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    path = daily_dir / f"{today}.md"
-    if not path.exists():
-        path.write_text(f"# {today}\n", encoding="utf-8")
-    with path.open("a", encoding="utf-8") as f:
-        f.write(f"\n### thread:{thread_id}\n{narrative}\n")
-    if indexer is not None:
-        try:
-            indexer.mark_dirty(f"{today}.md")
-        except Exception:
-            pass
-
 
 _SYSTEM = "Output strict JSON only. No prose. No code fences."
 
