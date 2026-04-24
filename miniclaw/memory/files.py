@@ -142,9 +142,9 @@ class MemoryFileStore:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             path = self.daily_dir / f"{today}.md"
             path.parent.mkdir(parents=True, exist_ok=True)
-            if not path.exists():
-                path.write_text(f"# {today}\n", encoding="utf-8")
             with path.open("a", encoding="utf-8") as f:
+                if f.tell() == 0:
+                    f.write(f"# {today}\n")
                 f.write(
                     f"\n### thread:{thread_id}\n<!-- source: {source} -->\n{narrative}\n"
                 )
