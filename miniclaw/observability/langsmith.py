@@ -7,6 +7,27 @@ from typing import Any
 from miniclaw.observability.contracts import TraceContext, build_run_context, build_span_context
 
 
+def _infer_run_type(name: str, explicit: str | None) -> str:
+    """Derive a LangSmith run_type from span name when no explicit type is given.
+
+    Mapping:
+      tool.*  / tool.call.*   → "tool"
+      provider.*              → "llm"
+      memory.retrieve / memory.search → "retriever"
+      everything else         → "chain"
+    """
+    if explicit is not None:
+        return explicit
+    lower = name.lower()
+    if lower.startswith("tool."):
+        return "tool"
+    if lower.startswith("provider."):
+        return "llm"
+    if lower in {"memory.retrieve", "memory.search"} or lower.startswith("memory.retrieve") or lower.startswith("memory.search"):
+        return "retriever"
+    return "chain"
+
+
 class LangSmithTracer:
     def __init__(
         self,
@@ -22,6 +43,8 @@ class LangSmithTracer:
         self.full_content = full_content
         self.max_chars = max(0, max_chars)
         self._start_times: dict[str, datetime] = {}
+        self._events: dict[str, list[dict[str, Any]]] = {}
+        self._start_metadata: dict[str, dict[str, Any]] = {}
 
     def start_run(
         self,
@@ -64,15 +87,20 @@ class LangSmithTracer:
         output: Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> None:
+        run_id = context.run_id
+        events = self._events.pop(run_id, [])
+        extra = self._base_extra(context, metadata=metadata, payload=output, status=status)
+        if events:
+            extra["events"] = events
         self._update_run(
-            run_id=context.run_id,
+            run_id=run_id,
             name=context.name,
             run_type="chain",
-            start_time=self._start_times.pop(context.run_id, None),
+            start_time=self._start_times.pop(run_id, None),
             end_time=_utc_now(),
             error=_status_to_error(status),
             outputs=self._truncate_mapping(dict(output or {})),
-            extra=self._base_extra(context, metadata=metadata, payload=output, status=status),
+            extra=extra,
         )
 
     def start_span(
@@ -86,8 +114,10 @@ class LangSmithTracer:
         run_type: str | None = None,
     ) -> TraceContext:
         context = context or build_span_context(parent, name=name, metadata=metadata)
-        self._start_times[context.span_id or context.run_id] = _utc_now()
-        resolved_run_type = run_type or "chain"
+        run_id = context.span_id or context.run_id
+        self._start_times[run_id] = _utc_now()
+        self._start_metadata[run_id] = dict(metadata or {})
+        resolved_run_type = _infer_run_type(name, run_type)
         resolved_inputs = (
             dict(inputs)
             if inputs is not None
@@ -100,7 +130,7 @@ class LangSmithTracer:
             )
         )
         self._create_run(
-            run_id=context.span_id or context.run_id,
+            run_id=run_id,
             trace_id=context.trace_id,
             parent_run_id=parent.span_id or parent.run_id,
             name=name,
@@ -120,20 +150,29 @@ class LangSmithTracer:
         outputs: Mapping[str, Any] | None = None,
     ) -> None:
         run_id = context.span_id or context.run_id
+        events = self._events.pop(run_id, [])
+        start_metadata = self._start_metadata.pop(run_id, {})
         resolved_outputs = (
             dict(outputs)
             if outputs is not None
             else self._truncate_mapping(dict(output or {}))
         )
+        span_name = context.name or ""
+        run_type = _infer_run_type(span_name, None)
+        extra = self._base_extra(context, metadata=metadata, payload=output, status=status)
+        if events:
+            extra["events"] = events
+        if run_type == "llm":
+            extra = _enrich_llm_extra(extra, start_metadata, events)
         self._update_run(
             run_id=run_id,
-            name=context.name,
-            run_type="chain",
+            name=span_name,
+            run_type=run_type,
             start_time=self._start_times.pop(run_id, None),
             end_time=_utc_now(),
             error=_status_to_error(status),
             outputs=resolved_outputs,
-            extra=self._base_extra(context, metadata=metadata, payload=output, status=status),
+            extra=extra,
         )
 
     def record_event(
@@ -159,15 +198,8 @@ class LangSmithTracer:
             "metadata": self._truncate_mapping(dict(metadata or {})),
             "payload": self._truncate_mapping(dict(payload or {})),
         }
-        self._update_run(
-            run_id=run_id,
-            extra={
-                "event": event,
-                "status": status,
-                "metadata": event["metadata"],
-                "payload": event["payload"],
-            },
-        )
+        bucket = self._events.setdefault(run_id, [])
+        bucket.append(event)
 
     def _truncate_mapping(self, value: Mapping[str, Any]) -> dict[str, Any]:
         return {str(key): self._truncate_value(item) for key, item in value.items()}
@@ -258,6 +290,24 @@ class LangSmithTracer:
             )
         except Exception:
             return None
+
+
+def _enrich_llm_extra(
+    extra: dict[str, Any],
+    metadata: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Lift model name and token usage into LangSmith-recognised extra keys."""
+    model = metadata.get("model") or metadata.get("provider.model")
+    if model:
+        invocation = dict(extra.get("invocation_params") or {})
+        invocation["model"] = model
+        extra = {**extra, "invocation_params": invocation}
+    for ev in events:
+        if ev.get("name") == "prompt.cache.usage":
+            extra = {**extra, "token_usage": ev.get("payload") or {}}
+            break
+    return extra
 
 
 def _ensure_tracing_env() -> None:
