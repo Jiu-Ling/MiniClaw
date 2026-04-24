@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -41,9 +42,16 @@ class MemoryDocument:
 
 
 class MemoryFileStore:
-    def __init__(self, path: Path, *, recent_work_limit: int = 3) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        recent_work_limit: int = 3,
+        daily_dir: Path | None = None,
+    ) -> None:
         self.path = Path(path)
         self.recent_work_limit = recent_work_limit
+        self.daily_dir = Path(daily_dir) if daily_dir is not None else self.path.parent / "daily"
         self._lock = threading.RLock()
 
     def read(self) -> MemoryDocument:
@@ -108,6 +116,39 @@ class MemoryFileStore:
                 long_term_facts=merged,
                 recent_work=document.recent_work,
             )
+
+    def append_to_daily_journal(
+        self,
+        thread_id: str,
+        narrative: str,
+        *,
+        source: str = "consolidation",
+    ) -> Path:
+        """Append a per-thread narrative to today's daily MD.
+
+        Daily MDs are the canonical persistent storage for conversation
+        narratives (recent_work in MEMORY.md is removed in Task 9). The
+        daily directory is indexed by FTS5+vec via MemoryIndexer; entries
+        are retrievable through memory_search.
+
+        Returns the file path written.
+        """
+        thread_id = thread_id.strip()
+        narrative = narrative.strip()
+        if not thread_id or not narrative:
+            raise ValueError("thread_id and narrative are required")
+
+        with self._lock:
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            path = self.daily_dir / f"{today}.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                path.write_text(f"# {today}\n", encoding="utf-8")
+            with path.open("a", encoding="utf-8") as f:
+                f.write(
+                    f"\n### thread:{thread_id}\n<!-- source: {source} -->\n{narrative}\n"
+                )
+            return path
 
     def _parse(self, text: str) -> MemoryDocument:
         critical_preferences: list[str] = []
