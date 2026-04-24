@@ -1,9 +1,14 @@
 """`remember` tool — agent writes a discovered fact to long-term memory.
 
 Phase 6 deliverable. Always-active and worker-visible so subagents can also
-remember findings (paths, API endpoints, decisions). Per-turn rate limit
-prevents fact spam. Critical-tier writes require a `reason` to discourage
-overclassification of stable preferences.
+remember findings (paths, API endpoints, decisions). Critical-tier writes
+require a `reason` to discourage overclassification of stable preferences.
+
+The `max_calls` parameter is a **process-wide soft cap** against runaway
+loops, not a per-turn limit (the registry is built once per RuntimeService
+and shared across turns). The real anti-spam defense is `add_fact`'s dedup.
+True per-turn reset would require threading turn context through ToolCall,
+which is V2 work.
 """
 from __future__ import annotations
 
@@ -15,12 +20,13 @@ from miniclaw.tools.registry import RegisteredTool
 def build_remember_tool(
     *,
     memory_store: MemoryFileStore,
-    max_per_turn: int = 5,
+    max_calls: int = 50,
 ) -> RegisteredTool:
-    """Construct a fresh remember tool.
+    """Build the remember tool. `max_calls` is a process-wide soft cap.
 
-    The closure holds the per-turn counter, so a new instance must be built
-    each turn (or the counter would persist across turns).
+    Set high enough that legitimate use never trips it; rely on `add_fact`'s
+    dedup to prevent spam from being persisted. Default 50 means even a very
+    chatty agent process won't hit the cap in normal operation.
     """
     state = {"used": 0}
 
@@ -39,9 +45,9 @@ def build_remember_tool(
                 is_error=True,
             )
 
-        if state["used"] >= max_per_turn:
+        if state["used"] >= max_calls:
             return ToolResult(
-                content=f"ERROR: rate limit reached (max {max_per_turn} remember calls per turn)",
+                content=f"ERROR: process-wide soft cap reached ({max_calls} remember calls). Restart process or rely on dedup.",
                 is_error=True,
             )
         state["used"] += 1

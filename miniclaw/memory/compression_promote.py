@@ -110,7 +110,7 @@ def schedule_compression_promotion(
                 )
                 if indexer is not None:
                     try:
-                        indexer.mark_dirty(str(written))
+                        indexer.mark_dirty(written.name)
                     except Exception:
                         pass
             except Exception as exc:

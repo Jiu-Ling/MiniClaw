@@ -160,7 +160,7 @@ def build_tool_registry(
         builtin_tools.append(
             build_remember_tool(
                 memory_store=memory_file_store,
-                max_per_turn=resolved_settings.remember_tool_max_per_turn if resolved_settings else 5,
+                max_calls=resolved_settings.remember_tool_max_calls if resolved_settings else 50,
             )
         )
     _CORE_TOOLS = {

@@ -131,7 +131,9 @@ class Settings(BaseSettings):
 
     # Remember tool (Phase 6)
     remember_tool_enabled: bool = True
-    remember_tool_max_per_turn: int = 5
+    # Process-wide soft cap on remember calls. Real anti-spam = add_fact dedup.
+    # Per-turn reset is V2; for now treat this as a runaway-loop guard only.
+    remember_tool_max_calls: int = 50
 
     # Prompt caching strategy.
     # "auto" → bootstrap detects from base_url (anthropic/dashscope → "anthropic",
