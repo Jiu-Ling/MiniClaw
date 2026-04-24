@@ -127,13 +127,16 @@ class MemoryFileStore:
         candidates: list[FactCandidate],
         *,
         dedup_against_existing: bool = True,
+        critical_max: int | None = None,
     ) -> AddFactsResult:
         """Bulk-write facts in a single read-modify-write cycle.
 
-        Dedups WITHIN the batch (case-fold + whitespace-collapse) AND, if
-        `dedup_against_existing=True`, against current MEMORY.md contents.
-        Empty facts count as skipped_duplicates. Critical-tier capping is
-        applied in Task 4.
+        Dedups WITHIN the batch and (if `dedup_against_existing`) against
+        existing MEMORY.md contents. Empty facts count as skipped_duplicates.
+
+        If `critical_max` is set and added critical facts push the count past
+        it, the oldest critical facts are evicted FIFO until the cap is met.
+        Eviction only runs when at least one critical fact was added.
         """
         with self._lock:
             doc = self.read()
@@ -149,6 +152,7 @@ class MemoryFileStore:
 
             added = 0
             skipped = 0
+            critical_added = 0
             for candidate in candidates:
                 fact = candidate.fact.strip()
                 if not fact:
@@ -161,11 +165,18 @@ class MemoryFileStore:
                 seen.add(normalized)
                 if candidate.tier == "critical":
                     new_critical.append(fact)
+                    critical_added += 1
                 else:
                     new_long_term.append(fact)
                 added += 1
 
-            if added > 0:
+            evicted = 0
+            if critical_max is not None and critical_added > 0:
+                while len(new_critical) > critical_max:
+                    new_critical.pop(0)
+                    evicted += 1
+
+            if added > 0 or evicted > 0:
                 self.update(
                     critical_preferences=new_critical,
                     long_term_facts=new_long_term,
@@ -174,7 +185,7 @@ class MemoryFileStore:
             return AddFactsResult(
                 added=added,
                 skipped_duplicates=skipped,
-                evicted_critical=0,
+                evicted_critical=evicted,
                 final_critical_count=len(new_critical),
                 final_long_term_count=len(new_long_term),
             )
