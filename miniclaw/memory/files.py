@@ -75,6 +75,53 @@ class MemoryFileStore:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(self._render(document), encoding="utf-8")
 
+    def add_fact(
+        self,
+        fact: str,
+        *,
+        tier: Literal["critical", "normal"] = "normal",
+        source: str = "agent",
+        reason: str = "",
+        dedup: bool = True,
+    ) -> bool:
+        """Idempotent single-fact write.
+
+        Returns True if the fact was added, False if skipped (empty or duplicate).
+        Dedup checks across BOTH critical_preferences and long_term_facts using
+        normalized exact-string match (`_normalize_for_dedup`).
+
+        `source` and `reason` are recorded in trace events but not persisted to MEMORY.md.
+        Critical-tier capping is enforced by `add_facts_batch`; this single-fact
+        API does not auto-evict — callers wanting capping should batch.
+        """
+        fact = fact.strip()
+        if not fact:
+            return False
+
+        with self._lock:
+            doc = self.read()
+            if dedup:
+                normalized = _normalize_for_dedup(fact)
+                existing = (
+                    _normalize_for_dedup(f)
+                    for f in (*doc.critical_preferences, *doc.long_term_facts)
+                )
+                if any(e == normalized for e in existing):
+                    return False
+
+            new_critical = list(doc.critical_preferences)
+            new_long_term = list(doc.long_term_facts)
+            if tier == "critical":
+                new_critical.append(fact)
+            else:
+                new_long_term.append(fact)
+
+            self.update(
+                critical_preferences=new_critical,
+                long_term_facts=new_long_term,
+            )
+            return True
+
     def append_to_daily_journal(
         self,
         thread_id: str,
