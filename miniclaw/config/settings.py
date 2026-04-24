@@ -129,6 +129,10 @@ class Settings(BaseSettings):
     compression_extract_timeout_s: float = 15.0
     compression_pinned_extract_enabled: bool = True
 
+    # Remember tool (Phase 6)
+    remember_tool_enabled: bool = True
+    remember_tool_max_per_turn: int = 5
+
     # Prompt caching strategy.
     # "auto" → bootstrap detects from base_url (anthropic/dashscope → "anthropic",
     #          openai → "openai_auto", unknown → "none").

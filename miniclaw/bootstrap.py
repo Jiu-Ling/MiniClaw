@@ -112,6 +112,7 @@ def build_tool_registry(
     tracer: TraceContext | None = None,
     retriever: HybridRetriever | None = None,
     heartbeat_file: Path | None = None,
+    memory_file_store: MemoryFileStore | None = None,
 ) -> ToolRegistry:
     resolved_settings = settings
     resolved_workspace = workspace or _workspace_root()
@@ -154,11 +155,20 @@ def build_tool_registry(
                 default_top_k=resolved_settings.memory_search_top_k if resolved_settings else 10,
             )
         )
+    if (resolved_settings is None or resolved_settings.remember_tool_enabled) and memory_file_store is not None:
+        from miniclaw.tools.builtin.remember import build_remember_tool
+        builtin_tools.append(
+            build_remember_tool(
+                memory_store=memory_file_store,
+                max_per_turn=resolved_settings.remember_tool_max_per_turn if resolved_settings else 5,
+            )
+        )
     _CORE_TOOLS = {
         "shell", "read_file", "write_file", "send", "web_search",
         "cron", "manage_heartbeat",
         "load_skill_tools", "load_mcp_tools",
         "spawn_subagent",
+        "remember",
     }
     for tool in builtin_tools:
         if tool.spec.name in _CORE_TOOLS:
@@ -363,6 +373,7 @@ def build_runtime_service(
         tracer=resolved_tracer,
         heartbeat_file=resolved_settings.heartbeat_file,
         retriever=resolved_retriever,
+        memory_file_store=resolved_memory_file_store,
     )
     resolved_thread_control_store = thread_control_store or build_thread_control_store(
         resolved_settings.sqlite_path
