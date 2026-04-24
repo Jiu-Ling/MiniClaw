@@ -271,10 +271,16 @@ def build_provider(settings: Settings | None = None) -> OpenAICompatibleProvider
 def build_mini_provider(settings: Settings) -> OpenAICompatibleProvider | None:
     if not settings.mini_model or not settings.mini_model_base_url:
         return None
+    mini_cache_strategy = _resolve_cache_strategy(
+        base_url=settings.mini_model_base_url or settings.base_url,
+        explicit=settings.cache_strategy,
+        enable_legacy_prompt_cache=settings.enable_prompt_cache,
+    )
     return OpenAICompatibleProvider(
         api_key=settings.mini_model_api_key or settings.api_key,
         base_url=settings.mini_model_base_url,
         model=settings.mini_model,
+        cache_strategy=mini_cache_strategy,
     )
 
 
