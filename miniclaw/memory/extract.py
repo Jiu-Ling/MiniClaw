@@ -55,7 +55,7 @@ _CONST_RE = re.compile(r"(?<!\w)([A-Z][A-Z0-9]*_[A-Z0-9_]+)(?!\w)")
 _CODE_BLOCK_RE = re.compile(r"```[a-zA-Z0-9_+\-]*\n(.*?)```", re.DOTALL)
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class PinnedReferences:
     """Verbatim references extracted from compressed messages."""
 
