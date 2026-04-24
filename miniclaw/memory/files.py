@@ -4,12 +4,41 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 
 @dataclass(slots=True)
 class MemoryDocument:
     critical_preferences: list[str] = field(default_factory=list)
     long_term_facts: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class FactCandidate:
+    """A candidate fact considered for write into MEMORY.md.
+
+    `tier=critical` requires non-empty `reason`. Caller responsibility.
+    `source` is free-form; common values: "agent", "compression", "user".
+    """
+
+    fact: str
+    tier: Literal["critical", "normal"] = "normal"
+    source: str = "agent"
+    reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class AddFactsResult:
+    added: int
+    skipped_duplicates: int
+    evicted_critical: int
+    final_critical_count: int
+    final_long_term_count: int
+
+
+def _normalize_for_dedup(value: str) -> str:
+    """Normalize a fact for exact-string dedup (case-fold + whitespace collapse)."""
+    return " ".join(value.casefold().split())
 
 
 class MemoryFileStore:
