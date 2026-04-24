@@ -34,6 +34,7 @@ def compress_memory_entry(text: str, max_chars: int = 200) -> str:
 
 @dataclass(slots=True)
 class MemoryDocument:
+    critical_preferences: list[str] = field(default_factory=list)
     long_term_facts: list[str] = field(default_factory=list)
     recent_work: dict[str, list[str]] = field(default_factory=dict)
 
@@ -55,10 +56,12 @@ class MemoryFileStore:
     def update(
         self,
         *,
+        critical_preferences: list[str] | None = None,
         long_term_facts: list[str],
         recent_work: dict[str, list[str]],
     ) -> None:
         document = MemoryDocument(
+            critical_preferences=self._normalize_lines(critical_preferences or []),
             long_term_facts=self._normalize_lines(long_term_facts),
             recent_work={
                 thread_id.strip(): self._normalize_lines(entries)[-self.recent_work_limit :]
@@ -97,20 +100,30 @@ class MemoryFileStore:
         self.update(long_term_facts=merged, recent_work=document.recent_work)
 
     def _parse(self, text: str) -> MemoryDocument:
+        critical_preferences: list[str] = []
         long_term_facts: list[str] = []
         recent_work: dict[str, list[str]] = {}
         current_thread: str | None = None
+        in_critical = False
         in_long_term = False
         in_recent = False
 
         for raw_line in text.splitlines():
             line = raw_line.strip()
+            if line == "## Critical Preferences":
+                in_critical = True
+                in_long_term = False
+                in_recent = False
+                current_thread = None
+                continue
             if line == "## Long-term Facts":
+                in_critical = False
                 in_long_term = True
                 in_recent = False
                 current_thread = None
                 continue
             if line == "## Recent Work":
+                in_critical = False
                 in_long_term = False
                 in_recent = True
                 current_thread = None
@@ -124,15 +137,32 @@ class MemoryFileStore:
                 continue
             if line == "-":
                 continue
-            if in_long_term and line.startswith("- "):
-                long_term_facts.append(line.removeprefix("- ").strip())
-            elif in_recent and current_thread and line.startswith("- "):
-                recent_work[current_thread].append(line.removeprefix("- ").strip())
+            if line.startswith("- "):
+                fact = line.removeprefix("- ").strip()
+                # Strip [id:N] prefix written by consolidation
+                if fact.startswith("[id:") and "] " in fact:
+                    fact = fact.split("] ", 1)[1]
+                if in_critical:
+                    critical_preferences.append(fact)
+                elif in_long_term:
+                    long_term_facts.append(fact)
+                elif in_recent and current_thread:
+                    recent_work[current_thread].append(fact)
 
-        return MemoryDocument(long_term_facts=long_term_facts, recent_work=recent_work)
+        return MemoryDocument(
+            critical_preferences=critical_preferences,
+            long_term_facts=long_term_facts,
+            recent_work=recent_work,
+        )
 
     def _render(self, document: MemoryDocument) -> str:
-        lines = ["# Memory", "", "## Long-term Facts"]
+        lines = ["# Memory", "", "## Critical Preferences"]
+        if document.critical_preferences:
+            lines.extend(f"- {fact}" for fact in document.critical_preferences)
+        else:
+            lines.append("-")
+
+        lines.extend(["", "## Long-term Facts"])
         if document.long_term_facts:
             lines.extend(f"- {fact}" for fact in document.long_term_facts)
         else:
