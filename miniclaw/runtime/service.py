@@ -105,8 +105,6 @@ class RuntimeService:
         self._persist_app = self._build_persist_app()
         self._compression_synced_threads: set[str] = set()
         self._on_compression = self._build_on_compression()
-        if memory_file_store is not None:
-            setattr(self.memory_store, "memory_file_store", memory_file_store)
 
     def _build_persist_app(self):
         """Build a minimal graph used only for persisting state to checkpoint."""
@@ -145,7 +143,6 @@ class RuntimeService:
         memory_file_store = self.memory_file_store
         indexer = self.memory_indexer
         scheduler = self.background_scheduler
-        daily_dir = self.settings.runtime_dir / "memory" / "daily"
         timeout_s = self.settings.compression_extract_timeout_s
         critical_max = self.settings.memory_critical_facts_max
 
@@ -156,7 +153,6 @@ class RuntimeService:
                 model=compression_model,
                 memory_store=memory_file_store,
                 indexer=indexer,
-                daily_dir=daily_dir,
                 event=event,
                 timeout_s=timeout_s,
                 critical_max=critical_max,
@@ -248,6 +244,7 @@ class RuntimeService:
             ),
             mini_provider=self.mini_provider,
             memory_store=self.memory_store,
+            memory_file_store=self.memory_file_store,
             tool_registry=_wrap_tool_registry(
                 self.tool_registry,
                 tracer=self.tracer,
@@ -375,6 +372,7 @@ class RuntimeService:
             ),
             mini_provider=self.mini_provider,
             memory_store=self.memory_store,
+            memory_file_store=self.memory_file_store,
             tool_registry=_wrap_tool_registry(
                 self.tool_registry,
                 tracer=self.tracer,
@@ -650,7 +648,7 @@ class RuntimeService:
         from miniclaw.runtime.background import BackgroundJob
 
         memory_path = self.settings.runtime_dir / "MEMORY.md"
-        daily_dir = self.settings.runtime_dir / "memory"
+        daily_dir = self.memory_file_store.daily_dir if self.memory_file_store is not None else None
         threshold = self.settings.memory_consolidation_trigger_threshold
         digests = [
             item.content for item in

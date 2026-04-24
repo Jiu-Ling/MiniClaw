@@ -297,7 +297,11 @@ def build_context_builder(settings: Settings | None = None) -> ContextBuilder:
 
 def build_memory_file_store(settings: Settings | None = None) -> MemoryFileStore:
     resolved_settings = settings or build_settings()
-    return MemoryFileStore(resolved_settings.sqlite_path.parent / "MEMORY.md")
+    memory_dir = resolved_settings.runtime_dir / "memory"
+    return MemoryFileStore(
+        resolved_settings.runtime_dir / "MEMORY.md",
+        daily_dir=memory_dir / "daily",
+    )
 
 
 def build_embedder(settings: Settings) -> OllamaEmbedder:
@@ -308,8 +312,15 @@ def build_embedder(settings: Settings) -> OllamaEmbedder:
     )
 
 
-def build_memory_indexer(settings: Settings, embedder: OllamaEmbedder) -> MemoryIndexer:
-    memory_dir = settings.runtime_dir / "memory"
+def build_memory_indexer(
+    settings: Settings,
+    embedder: OllamaEmbedder,
+    memory_file_store: MemoryFileStore | None = None,
+) -> MemoryIndexer:
+    if memory_file_store is not None:
+        memory_dir = memory_file_store.daily_dir
+    else:
+        memory_dir = settings.runtime_dir / "memory" / "daily"
     memory_dir.mkdir(parents=True, exist_ok=True)
     return MemoryIndexer(
         db_path=settings.sqlite_path,
@@ -364,7 +375,7 @@ def build_runtime_service(
             if resolved_retriever is None:
                 resolved_retriever = build_retriever(resolved_settings, embedder)
             if resolved_indexer is None:
-                resolved_indexer = build_memory_indexer(resolved_settings, embedder)
+                resolved_indexer = build_memory_indexer(resolved_settings, embedder, resolved_memory_file_store)
         except Exception:
             pass  # Ollama not available — degrade gracefully
 

@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from miniclaw.memory.extract import (
@@ -48,7 +47,6 @@ def schedule_compression_promotion(
     model: str,
     memory_store: MemoryFileStore,
     indexer: "MemoryIndexer | None",
-    daily_dir: Path,
     event: CompressionEvent,
     timeout_s: float = 15.0,
     critical_max: int | None = None,
@@ -58,8 +56,11 @@ def schedule_compression_promotion(
     The job:
       1. calls llm_extract_facts(provider, dropped_messages, pinned)
       2. add_facts_batch(facts_to_remember + discovered_facts)
-      3. append_to_daily_journal(thread_id, narrative, source="compression")
-      4. indexer.mark_dirty(daily_md_path) if indexer provided
+      3. memory_store.append_to_daily_journal(thread_id, narrative, source="compression")
+      4. indexer.mark_dirty(written.name) if indexer provided
+
+    daily_dir is determined by memory_store.daily_dir — set once in MemoryFileStore
+    and used as the single authoritative source.
 
     Failures are logged but never re-raised. Pinned references are already in
     the summary message (Phase 4 sync path), so a failed extraction only loses

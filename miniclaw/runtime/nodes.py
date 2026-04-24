@@ -30,6 +30,7 @@ from miniclaw.tools.registry import ToolRegistry
 
 if TYPE_CHECKING:
     from miniclaw.config.settings import Settings
+    from miniclaw.memory.files import MemoryFileStore
     from miniclaw.memory.indexer import MemoryIndexer
     from miniclaw.observability.contracts import Tracer
 
@@ -266,6 +267,7 @@ def _rule_based_classify(user_input: str) -> RuntimeState:
 def make_load_context(
     memory_store: object,
     *,
+    memory_file_store: "MemoryFileStore | None" = None,
     retriever: object | None = None,
     indexer: MemoryIndexer | None = None,
     memory_token_budget: int = 2000,
@@ -344,6 +346,7 @@ def make_load_context(
             memory_context = build_memory_context(
                 memory_store,
                 thread_id,
+                memory_file=memory_file_store,
                 retriever=retriever,
                 user_input=user_input,
                 memory_token_budget=memory_token_budget,

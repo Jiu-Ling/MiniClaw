@@ -25,6 +25,7 @@ from miniclaw.runtime.state import RuntimeState
 
 if TYPE_CHECKING:
     from miniclaw.config.settings import Settings
+    from miniclaw.memory.files import MemoryFileStore
     from miniclaw.memory.indexer import MemoryIndexer
     from miniclaw.memory.retriever import HybridRetriever
     from miniclaw.observability.contracts import TraceContext, Tracer
@@ -140,6 +141,7 @@ def build_graph(
     provider: "ChatProvider",
     mini_provider: "ChatProvider | None" = None,
     memory_store: "MemoryStore",
+    memory_file_store: "MemoryFileStore | None" = None,
     tool_registry: "ToolRegistry | None" = None,
     retriever: "HybridRetriever | None" = None,
     indexer: "MemoryIndexer | None" = None,
@@ -166,6 +168,7 @@ def build_graph(
         "load_context",
         make_load_context(
             memory_store,
+            memory_file_store=memory_file_store,
             retriever=retriever,
             indexer=indexer,
             memory_token_budget=memory_token_budget,

@@ -41,13 +41,12 @@ def build_memory_context(
     memory_token_budget: int = 2000,
     rewrite: "RewriteResult | None" = None,
 ) -> MemoryContext:
-    resolved_memory_file = memory_file or getattr(store, "memory_file_store", None)
     char_budget = memory_token_budget * _CHARS_PER_TOKEN
 
     critical: list[str] = []
     long_term: list[str] = []
-    if resolved_memory_file is not None:
-        document = resolved_memory_file.read()
+    if memory_file is not None:
+        document = memory_file.read()
         critical = list(document.critical_preferences)
         long_term = list(document.long_term_facts)
 
