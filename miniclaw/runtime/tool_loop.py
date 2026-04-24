@@ -294,10 +294,14 @@ def _exec_one_with_span(
 
     span: "TraceContext | None" = None
     try:
+        registered = tool_registry.get(tool_call.name)
+        metadata: dict[str, str] = {"tool.name": tool_call.name}
+        if registered is not None:
+            metadata["tool.source"] = registered.spec.source
         span = tracer.start_span(
             parent_trace,
             name=f"tool.{tool_call.name}",
-            metadata={"tool.name": tool_call.name},
+            metadata=metadata,
             inputs={"arguments": _safe_copy_for_trace(tool_call.arguments)},
         )
     except Exception:
