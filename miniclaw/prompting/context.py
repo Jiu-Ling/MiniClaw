@@ -341,6 +341,21 @@ class ContextBuilder:
                 "",
                 "## Memory",
                 "- MEMORY.md stores curated long-term facts. SQLite stores thread-local history.",
+                "",
+                "## Memory Management",
+                "",
+                "You have a `remember` tool for saving facts that should persist across",
+                "conversations. Call `remember(fact, tier)` proactively when you discover:",
+                "",
+                "- File paths, line numbers, function names that matter (tier=normal)",
+                "- API endpoints, port numbers, configuration values (tier=normal)",
+                "- User preferences stated explicitly (tier=critical, requires reason)",
+                "- Project decisions and their rationale (tier=normal)",
+                "",
+                "Don't wait until context is compressed — save facts when you find them.",
+                "Duplicates are auto-deduplicated, so calling extra times is safe.",
+                "",
+                "Critical preferences are limited (oldest evicted). Use sparingly.",
             ]
         ).strip()
 
