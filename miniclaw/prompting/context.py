@@ -95,17 +95,14 @@ class ContextBuilder:
         return [s for s in sections if s]
 
     def _build_dynamic_sections(self, state: Mapping[str, Any] | None = None) -> list[str]:
-        """Volatile: sandbox + Related Context + planner."""
+        """Volatile system content: sandbox + planner only.
+
+        related_context moved to user message <system-reminder> in Phase 3.
+        """
         sections: list[str] = []
         sandbox_section = self._build_sandbox_section(state)
         if sandbox_section:
             sections.append(sandbox_section)
-
-        memory_context = self._resolve_memory_context_struct(state)
-        related = memory_context.related_context.strip()
-        if related:
-            sections.append("## Related Context\n" + related)
-
         sections.extend(self._build_planner_sections(state))
         return [s for s in sections if s]
 
@@ -157,6 +154,11 @@ class ContextBuilder:
 
             runtime_metadata = self._resolve_runtime_metadata(state)
             runtime_metadata_block = render_runtime_metadata_block(runtime_metadata)
+            memory_context_struct = self._resolve_memory_context_struct(state)
+            reminder_text = self._build_user_message_reminders(
+                runtime_metadata_block=runtime_metadata_block,
+                related_context=memory_context_struct.related_context,
+            )
             current_turn_user_input = state.get("user_input")
 
             input_messages = list(state.get("messages", []))
@@ -164,16 +166,16 @@ class ContextBuilder:
                 content = item.get("content", "")
                 content_parts = [dict(part) for part in item.get("content_parts", []) if isinstance(part, dict)]
                 if (
-                    runtime_metadata_block
+                    reminder_text
                     and isinstance(current_turn_user_input, str)
                     and current_turn_user_input
                     and index == len(input_messages) - 1
                     and item["role"] == "user"
                 ):
                     if content_parts:
-                        content_parts.append({"type": "text", "text": runtime_metadata_block})
+                        content_parts.append({"type": "text", "text": reminder_text})
                     else:
-                        content = self._merge_user_content(content, runtime_metadata_block)
+                        content = self._merge_user_content(content, reminder_text)
                 payload: dict[str, Any] = {"role": item["role"]}
                 if content_parts:
                     payload["content_parts"] = content_parts
@@ -193,6 +195,8 @@ class ContextBuilder:
                 turn_summary_chars=self.compress_turn_summary_chars,
                 max_history_messages=self.max_history_messages,
             )
+
+            messages = self._apply_message_cache_breakpoints(messages)
 
             self._trace_prompt_messages(
                 tracer,
@@ -221,9 +225,47 @@ class ContextBuilder:
             raise
 
     @staticmethod
-    def _merge_user_content(content: str, runtime_metadata_block: str) -> str:
+    def _apply_message_cache_breakpoints(messages: list[ChatMessage]) -> list[ChatMessage]:
+        """Mark the last 1-2 non-system messages with cache_control: ephemeral.
+
+        BP4: the latest message (always marked).
+        BP3: the penultimate non-system message (only if >= 2 non-system messages exist).
+
+        Returns a new list of ChatMessage. Per Anthropic semantics, BP4 of turn N
+        becomes effectively cached for turn N+1 via the 20-block lookback.
+        """
+        result = list(messages)
+        non_system_indices = [i for i, m in enumerate(result) if m.role != "system"]
+        to_mark = non_system_indices[-2:]  # last 2 (or 1 if only 1 exists)
+        for idx in to_mark:
+            result[idx] = _mark_cache_control(result[idx])
+        return result
+
+    @staticmethod
+    def _build_user_message_reminders(
+        runtime_metadata_block: str,
+        related_context: str,
+    ) -> str:
+        """Build the combined <system-reminder> text to append to the latest user message.
+
+        runtime_metadata_block is already wrapped (handled by render_runtime_metadata_block).
+        related_context needs to be wrapped here.
+        Returns empty string if both inputs are empty.
+        """
+        reminders: list[str] = []
+        if runtime_metadata_block.strip():
+            reminders.append(runtime_metadata_block.strip())
+        related = related_context.strip()
+        if related:
+            reminders.append(
+                f"<system-reminder>\nrelated_context (retrieved from memory):\n{related}\n</system-reminder>"
+            )
+        return "\n\n".join(reminders)
+
+    @staticmethod
+    def _merge_user_content(content: str, reminder_text: str) -> str:
         content = content.rstrip()
-        return f"{content}\n\n{runtime_metadata_block}" if content else runtime_metadata_block
+        return f"{content}\n\n{reminder_text}" if content else reminder_text
 
     @staticmethod
     def _resolve_runtime_metadata(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -446,6 +488,35 @@ class ContextBuilder:
             "mcp_servers": [str(name) for name in getattr(active_capabilities, "mcp_servers", [])],
             "mcp_tools": [str(name) for name in getattr(active_capabilities, "mcp_tools", [])],
         }
+
+
+def _mark_cache_control(msg: ChatMessage) -> ChatMessage:
+    """Return a copy of msg with cache_control on the last content part.
+
+    Converts content (str) to content_parts if needed.
+    """
+    if msg.content_parts:
+        new_parts = [dict(p) for p in msg.content_parts]
+        new_parts[-1] = {**new_parts[-1], "cache_control": {"type": "ephemeral"}}
+        return _clone_with_parts(msg, new_parts)
+    if msg.content is not None and msg.content != "":
+        new_parts = [
+            {"type": "text", "text": msg.content, "cache_control": {"type": "ephemeral"}}
+        ]
+        return _clone_with_parts(msg, new_parts)
+    return msg  # nothing to mark (e.g. tool-call-only assistant message)
+
+
+def _clone_with_parts(msg: ChatMessage, new_parts: list[dict]) -> ChatMessage:
+    """Construct a new ChatMessage with content_parts replaced; preserve other fields."""
+    kwargs: dict[str, Any] = {"role": msg.role, "content_parts": new_parts}
+    if msg.name:
+        kwargs["name"] = msg.name
+    if msg.tool_call_id:
+        kwargs["tool_call_id"] = msg.tool_call_id
+    if msg.tool_calls:
+        kwargs["tool_calls"] = list(msg.tool_calls)
+    return ChatMessage(**kwargs)
 
 
 def _msg_chars(msg: ChatMessage) -> int:
