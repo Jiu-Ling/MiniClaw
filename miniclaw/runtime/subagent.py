@@ -413,18 +413,18 @@ def _build_messages(
 ) -> "list[Any]":
     """Build the initial [system, user] ChatMessage list for the subagent.
 
-    The system message is split into two content_parts:
-    - Static part (cache_control: ephemeral): role_prompt + stable runtime fields
-      (thread_id, channel). These are identical for all spawns of the same
-      (role, thread_id, channel) combination, enabling provider-side cache hits.
-    - Dynamic part (no cache_control): fleet_id and sub_id, which change per spawn.
+    System message holds only stable content (role prompt + thread_id + channel),
+    with cache_control: ephemeral so multiple spawns of the same
+    (role, thread_id, channel) share the same BP2 cache namespace.
+
+    Per-spawn data (fleet_id, sub_id) is injected into the user message via
+    <system-reminder>, keeping the system message identical across spawns.
     """
     from miniclaw.providers.contracts import ChatMessage
 
     role_defaults = ROLE_DEFAULTS.get(brief.role)
     role_prompt = role_defaults["prompt"] if role_defaults else _GENERIC_PROMPT
 
-    # Static segment: stable across all spawns of (role, thread_id, channel)
     static_lines = [
         role_prompt,
         "",
@@ -435,18 +435,20 @@ def _build_messages(
     ]
     static_text = "\n".join(static_lines)
 
-    # Dynamic segment: per-spawn (changes every dispatch)
-    dynamic_lines = [
-        f"fleet_id: {fleet_id}",
-        f"sub_id: {sub_id}",
-    ]
-    dynamic_text = "\n".join(dynamic_lines)
-
     user_lines = [f"Task: {brief.task}"]
     if brief.expected_output:
         user_lines.append(f"Expected output: {brief.expected_output}")
     if brief.context:
         user_lines.append("Context:\n" + "\n---\n".join(brief.context))
+
+    spawn_reminder = (
+        f"<system-reminder>\n"
+        f"subagent_dispatch:\n"
+        f"fleet_id: {fleet_id}\n"
+        f"sub_id: {sub_id}\n"
+        f"</system-reminder>"
+    )
+    user_lines.append(spawn_reminder)
     user_text = "\n\n".join(user_lines)
 
     return [
@@ -454,7 +456,6 @@ def _build_messages(
             role="system",
             content_parts=[
                 {"type": "text", "text": static_text, "cache_control": {"type": "ephemeral"}},
-                {"type": "text", "text": dynamic_text},
             ],
         ),
         ChatMessage(role="user", content=user_text),
