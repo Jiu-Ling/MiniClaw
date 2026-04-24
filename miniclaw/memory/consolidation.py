@@ -141,7 +141,11 @@ async def llm_consolidate(
         added += 1
 
     new_recent = {**recent, f"thread:{thread_id}": [narrative]}
-    _write_memory(memory_path, new_crit, new_norm, new_recent)
+    store.update(
+        critical_preferences=new_crit,
+        long_term_facts=new_norm,
+        recent_work=new_recent,
+    )
     if daily_dir is not None:
         _write_daily(daily_dir, thread_id, narrative, indexer)
     return ConsolidationResult(
@@ -159,28 +163,14 @@ def regex_consolidate_fallback(*, thread_id: str, memory_path: Path, digests: li
     key = f"thread:{thread_id}"
     entries = list(doc.recent_work.get(key, [])) + digests[-3:]
     doc.recent_work[key] = entries[-3:]
-    store.update(long_term_facts=doc.long_term_facts, recent_work=doc.recent_work)
+    store.update(
+        critical_preferences=doc.critical_preferences,
+        long_term_facts=doc.long_term_facts,
+        recent_work=doc.recent_work,
+    )
 
 
 # --- Helpers --------------------------------------------------------------
-
-def _write_memory(
-    path: Path, crit: list[str], norm: list[str], recent: dict[str, list[str]]
-) -> None:
-    lines = ["# Memory", "", "## Critical Preferences"]
-    lines += [f"- [id:{i}] {f}" for i, f in enumerate(crit)] or ["-"]
-    lines += ["", "## Long-term Facts"]
-    lines += [f"- [id:{len(crit)+i}] {f}" for i, f in enumerate(norm)] or ["-"]
-    lines += ["", "## Recent Work"]
-    if recent:
-        for key in sorted(recent):
-            lines += ["", f"### {key}"]
-            lines += ([f"- {e}" for e in recent[key]] or ["-"])
-    else:
-        lines.append("-")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
 
 def _write_daily(daily_dir: Path, thread_id: str, narrative: str, indexer: MemoryIndexer | None) -> None:
     daily_dir.mkdir(parents=True, exist_ok=True)
