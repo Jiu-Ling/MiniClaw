@@ -81,5 +81,5 @@ class CommandRegistry:
             aliases = ""
             if meta.aliases:
                 aliases = f" (alias: {', '.join('/' + a for a in meta.aliases)})"
-            lines.append(f"/{meta.name} — {meta.description}{aliases} \n")
+            lines.append(f"/{meta.name} — {meta.description}{aliases}")
         return "\n".join(lines)
