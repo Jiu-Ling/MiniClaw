@@ -71,7 +71,11 @@ async def llm_consolidate(
     critical_max: int = 12,
 ) -> ConsolidationResult:
     """Run LLM consolidation. RAISES on any failure."""
-    crit, norm, recent = _read_memory(memory_path)
+    store = MemoryFileStore(memory_path)
+    document = store.read()
+    crit = list(document.critical_preferences)
+    norm = list(document.long_term_facts)
+    recent = {k: list(v) for k, v in document.recent_work.items()}
     messages = _build_messages(crit, norm, digests, recent_exchanges)
 
     # Prefer achat_structured (function-calling based); fall back to raw achat + parse
@@ -159,39 +163,6 @@ def regex_consolidate_fallback(*, thread_id: str, memory_path: Path, digests: li
 
 
 # --- Helpers --------------------------------------------------------------
-
-def _read_memory(path: Path) -> tuple[list[str], list[str], dict[str, list[str]]]:
-    if not path.is_file():
-        return [], [], {}
-    crit: list[str] = []
-    norm: list[str] = []
-    recent: dict[str, list[str]] = {}
-    section = thread_key = None
-    for line in path.read_text(encoding="utf-8").splitlines():
-        s = line.strip()
-        if s == "## Critical Preferences":
-            section = "c"
-        elif s == "## Long-term Facts":
-            section = "n"
-        elif s == "## Recent Work":
-            section = "r"
-        elif s.startswith("## "):
-            section = None
-        elif section == "r" and s.startswith("### "):
-            thread_key = s.removeprefix("### ").strip()
-            recent.setdefault(thread_key, [])
-        elif s.startswith("- ") and s != "-":
-            fact = s.removeprefix("- ").strip()
-            if fact.startswith("[id:"):
-                fact = fact.split("] ", 1)[-1]
-            if section == "c":
-                crit.append(fact)
-            elif section == "n":
-                norm.append(fact)
-            elif section == "r" and thread_key:
-                recent[thread_key].append(fact)
-    return crit, norm, recent
-
 
 def _write_memory(
     path: Path, crit: list[str], norm: list[str], recent: dict[str, list[str]]
